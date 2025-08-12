@@ -226,7 +226,7 @@ class ObsidianMCPServer {
   private findVaultPath(): string {
     // Путь от plugin root до vault root
     // /path/to/vault/.obsidian/plugins/obsidian-mcp-plugin -> /path/to/vault/
-    const vaultPath = path.join(PLUGIN_ROOT, '../../');
+    const vaultPath = path.join(PLUGIN_ROOT, '../../../');
     const normalizedPath = path.resolve(vaultPath);
     console.error(`📂 Vault path detected: ${normalizedPath}/`);
     console.error(`📂 Plugin root dir: ${PLUGIN_ROOT}`);
