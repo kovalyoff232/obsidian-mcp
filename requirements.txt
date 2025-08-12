@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sentence-transformers
+numpy
+python-multipart
+mcp
+onnxruntime
+tokenizers

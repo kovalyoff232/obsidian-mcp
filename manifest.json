@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-mcp-plugin",
+  "name": "MCP Plugin",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "This plugin integrates Obsidian with the Model Context Protocol.",
+  "author": "Your Name",
+  "authorUrl": "https://obsidian.md",
+  "isDesktopOnly": false
+}
