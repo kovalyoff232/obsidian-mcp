@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { fileURLToPath } from "url";
 import path from "path";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, statSync } from "fs";
 import Fuse from "fuse.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -304,6 +304,57 @@ class ObsidianMCPServer {
     console.error(`📚 Loaded full content for ${this.indexData.length}/${this.indexData.length} notes`);
   }
 
+  // ПУБЛИЧНО: Полная переиндексация vault и перезагрузка поискового движка
+  public async reindexVault(): Promise<{ notes: number }> {
+    const INDEX_PATH = findIndexPath();
+    const vaultRoot = path.resolve(this.vaultPath);
+    const collected: ObsidianNote[] = [];
+
+    const walk = (dir: string) => {
+      const entries = readdirSync(dir);
+      for (const entry of entries) {
+        const full = path.join(dir, entry);
+        const st = statSync(full);
+        if (st.isDirectory()) {
+          walk(full);
+        } else if (st.isFile() && entry.toLowerCase().endsWith('.md')) {
+          const rel = path.relative(vaultRoot, full).replace(/\\/g, '/');
+          const content = readFileSync(full, 'utf-8');
+          collected.push({
+            path: rel,
+            content_preview: content.slice(0, 300),
+            title: path.basename(rel, '.md'),
+            description: content.split('\n').find(l => l.trim().length > 0)?.slice(0, 150) || '',
+            lastModified: new Date(st.mtimeMs).toISOString(),
+            fullPath: full
+          } as any);
+        }
+      }
+    };
+
+    walk(vaultRoot);
+
+    try {
+      writeFileSync(INDEX_PATH, JSON.stringify(collected, null, 2), { encoding: 'utf-8' });
+    } catch (e) {
+      console.error('❌ Failed to write index.json:', e);
+    }
+
+    this.indexData = collected.map((item, index) => ({
+      ...item,
+      id: item.id || `note_${index}`,
+      tags: item.tags || [],
+      links: item.links || [],
+      size: item.size || item.content_preview.length
+    }));
+
+    await this.loadFullContent();
+    this.initializeFuse();
+    this.isLoaded = true;
+    this.clearCache();
+    return { notes: this.indexData.length };
+  }
+
   // Инициализируем Fuse.js для мощного fuzzy поиска
   private initializeFuse(): void {
     const fuseOptions = {
@@ -323,6 +374,59 @@ class ObsidianMCPServer {
 
     this.fuse = new Fuse(this.indexData, fuseOptions);
     console.error(`🔧 Fuse.js initialized with ${this.indexData.length} searchable notes`);
+  }
+
+  // Инкрементальная индексация одного файла
+  private indexSingleFile(relativePathInput: string): void {
+    try {
+      const INDEX_PATH = findIndexPath();
+      const rel = relativePathInput.replace(/^\/+/, '');
+      const relWithExt = rel.toLowerCase().endsWith('.md') ? rel : `${rel}.md`;
+      const full = path.resolve(this.vaultPath, relWithExt);
+      if (!existsSync(full)) return;
+      const st = statSync(full);
+      const content = readFileSync(full, 'utf-8');
+      const title = path.basename(relWithExt, '.md');
+      const description = content.split('\n').find(l => l.trim().length > 0)?.slice(0, 150) || '';
+
+      const updated: ObsidianNote = {
+        path: relWithExt,
+        content_preview: content.slice(0, 300),
+        title,
+        description,
+        lastModified: new Date(st.mtimeMs).toISOString(),
+        fullPath: full
+      } as any;
+
+      const idx = this.indexData.findIndex(n => n.path === relWithExt);
+      if (idx >= 0) {
+        this.indexData[idx] = { ...this.indexData[idx], ...updated };
+      } else {
+        this.indexData.push({ ...updated, id: `note_${this.indexData.length}` });
+      }
+
+      // моментально обновляем содержимое и перестраиваем Fuse
+      const noteRef = this.indexData.find(n => n.path === relWithExt)!;
+      noteRef.content = content;
+      this.initializeFuse();
+      this.clearCache();
+
+      // сохраняем индекс на диск
+      try {
+        writeFileSync(INDEX_PATH, JSON.stringify(this.indexData.map(n => ({
+          path: n.path,
+          content_preview: n.content_preview,
+          title: n.title,
+          description: n.description,
+          lastModified: n.lastModified,
+          fullPath: n.fullPath
+        })), null, 2), { encoding: 'utf-8' });
+      } catch (e) {
+        console.error('❌ Failed to persist incremental index:', e);
+      }
+    } catch (e) {
+      console.error('❌ indexSingleFile error:', e);
+    }
   }
 
   // Расширяем поисковый запрос синонимами
@@ -1025,19 +1129,407 @@ class ObsidianMCPServer {
   // Получаем заметку по ID для полного контента
   public getFullNoteContent(noteId: string): string | null {
     const note = this.getNote(noteId);
-    if (!note || !note.fullPath) {
-      return null;
+    // Если нашли в индексе — читаем по fullPath
+    if (note && note.fullPath) {
+      try {
+        const fullContent = readFileSync(note.fullPath, 'utf-8');
+        console.error(`📄 Successfully read full content for indexed note: ${note.title} (${fullContent.length} chars)`);
+        return fullContent;
+      } catch (error) {
+        console.error(`❌ Error reading indexed note ${noteId}:`, error);
+        return note.content || note.content_preview || null;
+      }
     }
 
+    // 🔁 ФОЛЛБЭК: пробуем трактовать noteId как относительный путь в vault
     try {
-      // Читаем полное содержимое файла
-      const fullContent = readFileSync(note.fullPath, 'utf-8');
-      console.error(`📄 Successfully read full content for: ${note.title} (${fullContent.length} chars)`);
-      return fullContent;
+      const rel = noteId.replace(/^\/+/, '');
+      const relWithExt = rel.toLowerCase().endsWith('.md') ? rel : `${rel}.md`;
+      const absolutePath = path.resolve(this.vaultPath, relWithExt);
+      if (!absolutePath.startsWith(path.resolve(this.vaultPath))) {
+        console.error(`❌ Rejected path outside vault: ${noteId}`);
+        return null;
+      }
+      if (existsSync(absolutePath)) {
+        const fullContent = readFileSync(absolutePath, 'utf-8');
+        console.error(`📄 Successfully read full content by path: ${relWithExt} (${fullContent.length} chars)`);
+        return fullContent;
+      }
     } catch (error) {
-      console.error(`❌ Error reading full content for ${noteId}:`, error);
-      return note.content || note.content_preview || null;
+      console.error(`❌ Fallback read error for ${noteId}:`, error);
     }
+
+    return null;
+  }
+  // ПУБЛИЧНЫЙ: безопасно записывает файл заметки в vault
+  public writeNote(options: {
+    filePath: string;
+    content: string;
+    writeMode?: 'create' | 'overwrite' | 'append';
+    frontmatter?: Record<string, any>;
+    heading?: string;
+    ensureMdExtension?: boolean;
+    createMissingFolders?: boolean;
+  }): {
+    absolutePath: string;
+    relativePath: string;
+    bytesWritten: number;
+    created: boolean;
+    overwritten: boolean;
+    appended: boolean;
+  } {
+    const {
+      filePath,
+      content,
+      writeMode = 'create',
+      frontmatter,
+      heading,
+      ensureMdExtension = true,
+      createMissingFolders = true
+    } = options;
+
+    if (!filePath || !content) {
+      throw new Error('filePath and content are required');
+    }
+
+    const normalizedRel = filePath.replace(/^\/+/, '');
+    const relWithExt = ensureMdExtension && !normalizedRel.toLowerCase().endsWith('.md')
+      ? `${normalizedRel}.md`
+      : normalizedRel;
+
+    const vaultRoot = path.resolve(this.vaultPath);
+    const absolutePath = path.resolve(vaultRoot, relWithExt);
+    if (!absolutePath.startsWith(vaultRoot)) {
+      throw new Error(`Resolved path escapes vault root: ${filePath}`);
+    }
+
+    // Создаем директории при необходимости
+    if (createMissingFolders) {
+      const dir = path.dirname(absolutePath);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+    }
+
+    const fileExists = existsSync(absolutePath);
+    if (writeMode === 'create' && fileExists) {
+      throw new Error(`File already exists: ${relWithExt}. Use overwrite or append.`);
+    }
+
+    if (writeMode === 'overwrite' || (writeMode === 'create' && !fileExists)) {
+      const finalContent = this.buildMarkdownWithFrontmatter(frontmatter, content);
+      writeFileSync(absolutePath, finalContent, { encoding: 'utf-8' });
+      // 🔄 Инкрементальная индексация
+      try { this.indexSingleFile(relWithExt); } catch {}
+      return {
+        absolutePath,
+        relativePath: relWithExt,
+        bytesWritten: Buffer.byteLength(finalContent, 'utf-8'),
+        created: !fileExists,
+        overwritten: fileExists,
+        appended: false
+      };
+    }
+
+    // append mode
+    let bytesWritten = 0;
+    if (!fileExists) {
+      // Если файла нет, при append создаем новый с (опц.) frontmatter и контентом
+      const initial = this.buildMarkdownWithFrontmatter(frontmatter, heading ? `## ${heading}\n\n${content}` : content);
+      writeFileSync(absolutePath, initial, { encoding: 'utf-8' });
+      bytesWritten = Buffer.byteLength(initial, 'utf-8');
+      return {
+        absolutePath,
+        relativePath: relWithExt,
+        bytesWritten,
+        created: true,
+        overwritten: false,
+        appended: true
+      };
+    }
+
+    // Файл существует: читаем и дописываем
+    const original = readFileSync(absolutePath, 'utf-8');
+    let updated = original;
+    if (heading && heading.trim().length > 0) {
+      updated = this.appendUnderHeading(original, heading.trim(), content);
+    } else {
+      const needsNewline = !original.endsWith('\n');
+      updated = original + (needsNewline ? '\n\n' : '\n') + content + '\n';
+    }
+    writeFileSync(absolutePath, updated, { encoding: 'utf-8' });
+    bytesWritten = Buffer.byteLength(updated, 'utf-8') - Buffer.byteLength(original, 'utf-8');
+    // 🔄 Инкрементальная индексация
+    try { this.indexSingleFile(relWithExt); } catch {}
+    return {
+      absolutePath,
+      relativePath: relWithExt,
+      bytesWritten,
+      created: false,
+      overwritten: false,
+      appended: true
+    };
+  }
+
+  private buildMarkdownWithFrontmatter(frontmatter: Record<string, any> | undefined, content: string): string {
+    if (!frontmatter || Object.keys(frontmatter).length === 0) {
+      return content;
+    }
+    const yaml = Object.entries(frontmatter)
+      .map(([key, value]) => {
+        if (Array.isArray(value)) {
+          return `${key}: [${value.map(v => JSON.stringify(v)).join(', ')}]`;
+        }
+        if (value && typeof value === 'object') {
+          return `${key}: ${JSON.stringify(value)}`;
+        }
+        return `${key}: ${JSON.stringify(value)}`;
+      })
+      .join('\n');
+    return `---\n${yaml}\n---\n\n${content}`;
+  }
+
+  private appendUnderHeading(original: string, heading: string, addition: string): string {
+    const lines = original.split('\n');
+    const headingRegex = new RegExp(`^#{1,6}\\s+${this.escapeRegex(heading)}\\s*$`, 'i');
+    const index = lines.findIndex(line => headingRegex.test(line));
+    if (index === -1) {
+      const suffix = (original.endsWith('\n') ? '' : '\n') + `\n## ${heading}\n\n${addition}\n`;
+      return original + suffix;
+    }
+    let insertAt = index + 1;
+    while (insertAt < lines.length && lines[insertAt].trim() === '') insertAt++;
+    const before = lines.slice(0, insertAt).join('\n');
+    const after = lines.slice(insertAt).join('\n');
+    const middle = (before.endsWith('\n') ? '' : '\n') + '\n' + addition + '\n';
+    return before + middle + (after ? '\n' + after : '');
+  }
+
+  private parseFrontmatterAndBody(original: string): { frontmatter: Record<string, any>, body: string } {
+    const fmMatch = original.match(/^---\n([\s\S]*?)\n---\n?/);
+    let body = original;
+    const obj: Record<string, any> = {};
+    if (fmMatch) {
+      const fmText = fmMatch[1];
+      body = original.slice(fmMatch[0].length);
+      for (const line of fmText.split('\n')) {
+        const m = line.match(/^([^:]+):\s*(.*)$/);
+        if (m) {
+          const key = m[1].trim();
+          let val: any = m[2].trim();
+          if (val.startsWith('[') || val.startsWith('{')) {
+            try { val = JSON.parse(val); } catch {}
+          } else if (/^".*"$/.test(val) || /^'.*'$/.test(val)) {
+            val = val.slice(1, -1);
+          }
+          obj[key] = val;
+        }
+      }
+    }
+    return { frontmatter: obj, body };
+  }
+
+  // ПУБЛИЧНЫЙ: создать «нод» — заметку с frontmatter (id, type, props)
+  public createNode(options: {
+    filePath: string;
+    title?: string;
+    type?: string;
+    properties?: Record<string, any>;
+    content?: string;
+    ensureMdExtension?: boolean;
+    createMissingFolders?: boolean;
+  }) {
+    const { filePath, title, type, properties, content = '', ensureMdExtension = true, createMissingFolders = true } = options;
+    const fm: Record<string, any> = { ...(properties || {}) };
+    if (title) fm.title = title;
+    if (type) fm.type = type;
+    return this.writeNote({ filePath, content, writeMode: 'create', frontmatter: fm, ensureMdExtension, createMissingFolders });
+  }
+
+  // ПУБЛИЧНЫЙ: создать связь A->B (и опц. B->A)
+  public linkNotes(options: {
+    fromPath: string;
+    toPath: string;
+    relation?: string; // имя свойства списка ссылок, например related/depends_on
+    mode?: 'property' | 'body' | 'both';
+    bidirectional?: boolean;
+    heading?: string; // для body-режима
+  }) {
+    const { fromPath, toPath, relation = 'related', mode = 'both', bidirectional = true, heading = 'Relations' } = options;
+
+    // Ссылка формата [[path]]
+    const toWikilink = this.toWikiLink(toPath);
+    const fromWikilink = this.toWikiLink(fromPath);
+
+    const updates: Array<() => void> = [];
+
+    if (mode === 'property' || mode === 'both') {
+      updates.push(() => this.upsertLinkInFrontmatter(fromPath, relation, toWikilink));
+      if (bidirectional) updates.push(() => this.upsertLinkInFrontmatter(toPath, relation, fromWikilink));
+    }
+    if (mode === 'body' || mode === 'both') {
+      updates.push(() => this.appendRelationBody(fromPath, heading, toWikilink));
+      if (bidirectional) updates.push(() => this.appendRelationBody(toPath, heading, fromWikilink));
+    }
+
+    for (const fn of updates) fn();
+
+    return { ok: true, fromPath, toPath, relation, mode, bidirectional };
+  }
+
+  private toWikiLink(relPath: string): string {
+    const withExt = relPath.toLowerCase().endsWith('.md') ? relPath : `${relPath}.md`;
+    // Превращаем путь в название заметки без .md для wikilink
+    const noteName = path.basename(withExt, '.md');
+    return `[[${noteName}]]`;
+  }
+
+  private upsertLinkInFrontmatter(filePath: string, relation: string, wikilink: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const relWithExt = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
+    const absolutePath = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+    if (!absolutePath.startsWith(vaultRoot)) throw new Error('Path escape detected');
+
+    let original = '';
+    if (existsSync(absolutePath)) {
+      original = readFileSync(absolutePath, 'utf-8');
+    } else {
+      // создаём, если отсутствует
+      writeFileSync(absolutePath, this.buildMarkdownWithFrontmatter({}, ''), { encoding: 'utf-8' });
+      original = readFileSync(absolutePath, 'utf-8');
+    }
+
+    // Парсим frontmatter (простая стратегия)
+    const { frontmatter: obj, body } = this.parseFrontmatterAndBody(original);
+
+    // upsert в список ссылок
+    const list = Array.isArray(obj[relation]) ? obj[relation] : (obj[relation] ? [obj[relation]] : []);
+    if (!list.includes(wikilink)) list.push(wikilink);
+    obj[relation] = list;
+
+    const newContent = this.buildMarkdownWithFrontmatter(obj, body.trimStart());
+    writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
+    // 🔄 Инкрементальная индексация
+    try { this.indexSingleFile(relWithExt); } catch {}
+  }
+
+  private appendRelationBody(filePath: string, heading: string, wikilink: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const relWithExt = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
+    const absolutePath = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+    if (!absolutePath.startsWith(vaultRoot)) throw new Error('Path escape detected');
+
+    if (!existsSync(absolutePath)) {
+      writeFileSync(absolutePath, `## ${heading}\n\n${wikilink}\n`, { encoding: 'utf-8' });
+      return;
+    }
+    const original = readFileSync(absolutePath, 'utf-8');
+    const updated = this.appendUnderHeading(original, heading, wikilink);
+    writeFileSync(absolutePath, updated, { encoding: 'utf-8' });
+    // 🔄 Инкрементальная индексация
+    try { this.indexSingleFile(relWithExt); } catch {}
+  }
+
+  public upsertFrontmatter(options: {
+    filePath: string;
+    set?: Record<string, any>;
+    removeKeys?: string[];
+    ensureMdExtension?: boolean;
+    createMissingFolders?: boolean;
+  }) {
+    const { filePath, set, removeKeys, ensureMdExtension = true, createMissingFolders = true } = options;
+    const vaultRoot = path.resolve(this.vaultPath);
+    const relWithExt = ensureMdExtension && !filePath.toLowerCase().endsWith('.md') ? `${filePath}.md` : filePath;
+    const absolutePath = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+    if (!absolutePath.startsWith(vaultRoot)) throw new Error('Path escape detected');
+
+    if (createMissingFolders) {
+      const dir = path.dirname(absolutePath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    }
+
+    let original = existsSync(absolutePath) ? readFileSync(absolutePath, 'utf-8') : '';
+    if (!original) original = this.buildMarkdownWithFrontmatter({}, '');
+
+    const { frontmatter, body } = this.parseFrontmatterAndBody(original);
+    if (set) {
+      for (const [k, v] of Object.entries(set)) frontmatter[k] = v;
+    }
+    if (removeKeys) {
+      for (const k of removeKeys) delete frontmatter[k];
+    }
+    const newContent = this.buildMarkdownWithFrontmatter(frontmatter, body.trimStart());
+    writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
+    // 🔄 Инкрементальная индексация
+    try { this.indexSingleFile(relWithExt); } catch {}
+    return { absolutePath, relativePath: relWithExt };
+  }
+
+  public unlinkNotes(options: {
+    fromPath: string;
+    toPath: string;
+    relation?: string;
+    mode?: 'property' | 'body' | 'both';
+    bidirectional?: boolean;
+    heading?: string;
+  }) {
+    const { fromPath, toPath, relation = 'related', mode = 'both', bidirectional = true, heading = 'Relations' } = options;
+    const toWikilink = this.toWikiLink(toPath);
+    const fromWikilink = this.toWikiLink(fromPath);
+
+    const updates: Array<() => void> = [];
+    if (mode === 'property' || mode === 'both') {
+      updates.push(() => this.removeLinkFromFrontmatter(fromPath, relation, toWikilink));
+      if (bidirectional) updates.push(() => this.removeLinkFromFrontmatter(toPath, relation, fromWikilink));
+    }
+    if (mode === 'body' || mode === 'both') {
+      updates.push(() => this.removeRelationInBody(fromPath, heading, toWikilink));
+      if (bidirectional) updates.push(() => this.removeRelationInBody(toPath, heading, fromWikilink));
+    }
+    for (const fn of updates) fn();
+    return { ok: true };
+  }
+
+  private removeLinkFromFrontmatter(filePath: string, relation: string, wikilink: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const relWithExt = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
+    const absolutePath = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+    if (!absolutePath.startsWith(vaultRoot)) throw new Error('Path escape detected');
+    if (!existsSync(absolutePath)) return;
+    const original = readFileSync(absolutePath, 'utf-8');
+    const { frontmatter, body } = this.parseFrontmatterAndBody(original);
+    if (frontmatter[relation]) {
+      const arr = Array.isArray(frontmatter[relation]) ? frontmatter[relation] : [frontmatter[relation]];
+      const filtered = arr.filter((x: any) => x !== wikilink);
+      if (filtered.length === 0) delete frontmatter[relation]; else frontmatter[relation] = filtered;
+      const newContent = this.buildMarkdownWithFrontmatter(frontmatter, body.trimStart());
+      writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
+      // 🔄 Инкрементальная индексация
+      try { this.indexSingleFile(relWithExt); } catch {}
+    }
+  }
+
+  private removeRelationInBody(filePath: string, heading: string, wikilink: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const relWithExt = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
+    const absolutePath = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+    if (!absolutePath.startsWith(vaultRoot)) throw new Error('Path escape detected');
+    if (!existsSync(absolutePath)) return;
+    const original = readFileSync(absolutePath, 'utf-8');
+    const lines = original.split('\n');
+    const headingRegex = new RegExp(`^#{1,6}\\s+${this.escapeRegex(heading)}\\s*$`, 'i');
+    const idx = lines.findIndex(line => headingRegex.test(line));
+    if (idx === -1) return;
+    let end = idx + 1;
+    while (end < lines.length && !/^#{1,6}\s+/.test(lines[end])) end++;
+    const before = lines.slice(0, idx + 1);
+    const section = lines.slice(idx + 1, end);
+    const after = lines.slice(end);
+    const filtered = section.filter(line => !line.includes(wikilink));
+    const updated = [...before, ...filtered, ...after].join('\n');
+    writeFileSync(absolutePath, updated, { encoding: 'utf-8' });
+    // 🔄 Инкрементальная индексация
+    try { this.indexSingleFile(relWithExt); } catch {}
   }
 
   private getNote(noteId: string): ObsidianNote | null {
@@ -1111,33 +1603,34 @@ export function createServer() {
       tools: [
         {
           name: "search-notes",
-          description: `🔍 **ИДЕАЛЬНЫЙ ПОИСК** по заметкам Obsidian с мощными возможностями:
+          description: `🔍 ИДЕАЛЬНЫЙ ПОИСК по заметкам Obsidian, оптимизированный для LLM-агентов.
 
-🎯 **HIGHLIGHTING** - найденные слова подсвечиваются жирным **текстом**
-🔗 **СВЯЗАННЫЕ ЗАМЕТКИ** - автоматически находит связанные заметки  
-🔍 **РАСШИРЕННЫЕ ОПЕРАТОРЫ**:
-  • "точная фраза" - поиск точного совпадения
-  • +обязательное слово - должно присутствовать
-  • -исключить слово - не должно быть
-  • title:заголовок - поиск в заголовках
-  • path:путь - поиск по пути файла
-  • tags:тег - поиск по тегам
-  • content:содержимое - поиск в содержимом
+Назначение: находить заметки по смыслу, поддерживать расширенные операторы и возвращать читаемый список.
 
-📊 **КАТЕГОРИЗАЦИЯ** - результаты группируются по типам:
-  📚 Документация, 📋 ТЗ, 💻 Код, 🎓 Обучение, ✅ TODO и др.
+🎯 HIGHLIGHTING — найденные слова подсвечиваются жирным **текстом**
+🔗 Связанные заметки — автоматическое расширение хороших результатов  
+🔍 Расширенные операторы:
+  • "точная фраза" — поиск точного совпадения
+  • +обязательное — слово должно присутствовать
+  • -исключить — слово не должно встречаться
+  • title:заголовок, path:путь, tags:тег, content:содержимое
 
-⚡ **УМНОЕ КЭШИРОВАНИЕ** - мгновенные повторные запросы
-🧠 **FUZZY SEARCH** - находит даже при опечатках  
-📈 **АНАЛИТИКА** - статистика поиска каждые 10 запросов
+Категоризация: результаты помечаются типами (📚 Документация, 📋 ТЗ, 💻 Код, 🎓 Обучение, ✅ TODO и др.)
 
-**Примеры запросов:**
+Кэш: мгновенные повторные запросы. Fuzzy-поиск устойчив к опечаткам. Ведётся аналитика.
+
+Советы для агента:
+- Комбинируй запросы с полями (title/path/tags) для точности.
+- Если используешь только поля — добавь одно-два общих термина.
+- Начинай с общего запроса и при необходимости уточняй.
+
+Примеры:
 - javascript код
 - "техническое задание" +gambit -старый  
 - title:readme path:docs
 - функция массив база
 
-Поиск работает на русском и английском языках с поддержкой синонимов.`,
+Поиск работает на русском и английском; доступны синонимы.`,
           inputSchema: {
             type: "object",
             properties: {
@@ -1151,18 +1644,14 @@ export function createServer() {
         },
         {
           name: "get-note-content",
-          description: `📄 Получить **ПОЛНОЕ СОДЕРЖИМОЕ** заметки по её ID, пути или заголовку. 
+          description: `📄 Получить ПОЛНОЕ СОДЕРЖИМОЕ заметки по её ID, пути или заголовку.
 
-Возвращает весь текст заметки для полного анализа и работы с содержимым.
+Назначение: когда нужен полный контент или извлечение секций по теме.
 
-**Входные данные:**
-- ID заметки (из результатов поиска)
-- Путь к заметке (например, "документация/readme.md") 
-- Заголовок заметки
-
-**Возвращает:**
-- Полный текст заметки в markdown формате
-- Метаинформацию о заметке`,
+Советы для агента:
+- context7CompatibleLibraryID — это ID/путь/заголовок из search-notes.
+- tokens ограничивает примерный размер (≈4 символа = 1 токен).
+- topic добавит релевантные секции в начало ответа.`,
           inputSchema: {
             type: "object", 
             properties: {
@@ -1180,6 +1669,178 @@ export function createServer() {
               }
             },
             required: ["context7CompatibleLibraryID"]
+          }
+        },
+        {
+          name: "write-note",
+          description: `✍️ Создать/перезаписать/дописать заметку (LLM-safe API).
+
+Режимы:
+- create — создать (ошибка, если файл существует)
+- overwrite — перезаписать целиком (передавай итоговый текст)
+- append — дописать в конец или под heading
+
+Frontmatter: можно передать объект ключ-значение (Yaml/JSON сериализуется автоматически).
+
+Рекомендации:
+- Для append укажи heading, чтобы структурировать добавления.
+- Для overwrite присылай полный финальный текст.
+
+Примеры путей: "inbox/today" или "документация/new-note.md"` ,
+          inputSchema: {
+            type: "object",
+            properties: {
+              filePath: {
+                type: "string",
+                description: "Относительный путь в vault (с .md или без)"
+              },
+              content: {
+                type: "string",
+                description: "Markdown-содержимое для записи"
+              },
+              writeMode: {
+                type: "string",
+                enum: ["create", "overwrite", "append"],
+                description: "Режим записи"
+              },
+              heading: {
+                type: "string",
+                description: "Если указан, при append допишет под этим заголовком (создаст при отсутствии)"
+              },
+              frontmatter: {
+                type: "object",
+                description: "Опциональный YAML frontmatter (ключ-значение)"
+              },
+              ensureMdExtension: {
+                type: "boolean",
+                description: "Добавить .md, если отсутствует",
+                default: true
+              },
+              createMissingFolders: {
+                type: "boolean",
+                description: "Создавать недостающие папки",
+                default: true
+              }
+            },
+            required: ["filePath", "content"]
+          }
+        },
+        {
+          name: "append-under-heading",
+          description: `➕ Точное дописывание под указанным заголовком.
+
+Опции:
+- Автосоздание заголовка, если он отсутствует
+- Автопрефикс времени (ISO)
+- Буллеты для списков
+
+Советы:
+- Для логов задач ставь bullet=true и timestamp=true.
+- Пиши атомарные короткие записи.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              filePath: { type: "string", description: "Путь к заметке (относительно vault)" },
+              heading: { type: "string", description: "Заголовок, под которым нужно дописать" },
+              content: { type: "string", description: "Текст для дописывания" },
+              bullet: { type: "boolean", description: "Добавить '-' перед строкой", default: false },
+              timestamp: { type: "boolean", description: "Добавить ISO-время перед строкой", default: false },
+              ensureMdExtension: { type: "boolean", default: true },
+              createMissingFolders: { type: "boolean", default: true }
+            },
+            required: ["filePath", "heading", "content"]
+          }
+        },
+        {
+          name: "create-node",
+          description: `📦 Создать «ноду» — заметку с frontmatter (title, type, properties) и контентом.
+
+Назначение: формирование вершин графа знаний. Свойства читаются Dataview/Graph.
+Рекомендации: задавай говорящие title/type. В properties можно передавать массивы и объекты.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              filePath: { type: "string", description: "Путь для новой заметки" },
+              title: { type: "string", description: "Заголовок (frontmatter.title)" },
+              type: { type: "string", description: "Тип ноды (frontmatter.type)" },
+              properties: { type: "object", description: "Доп. свойства фронтматтера" },
+              content: { type: "string", description: "Начальный контент" },
+              ensureMdExtension: { type: "boolean", default: true },
+              createMissingFolders: { type: "boolean", default: true }
+            },
+            required: ["filePath"]
+          }
+        },
+        {
+          name: "link-notes",
+          description: `🔗 Связать две заметки (A→B), с опцией двунаправленной связи.
+
+Режимы:
+- property — добавить wikilink в список frontmatter (relation, по умолчанию related)
+- body — дописать wikilink под заголовком (heading, по умолчанию Relations)
+- both — записать и туда, и туда
+
+Лучшие практики:
+- Для зависимостей используй relation="depends_on".
+- Для навигации — relation="related".
+- bidirectional=true обычно полезно`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              fromPath: { type: "string", description: "Относительный путь A" },
+              toPath: { type: "string", description: "Относительный путь B" },
+              relation: { type: "string", description: "Имя свойства-списка ссылок", default: "related" },
+              mode: { type: "string", enum: ["property", "body", "both"], default: "both" },
+              bidirectional: { type: "boolean", default: true },
+              heading: { type: "string", description: "Заголовок для body-режима", default: "Relations" }
+            },
+            required: ["fromPath", "toPath"]
+          }
+        },
+        {
+          name: "upsert-frontmatter",
+          description: `🧩 Безопасно обновить фронтматтер: set/remove ключи.
+
+Советы: ссылки передавай как wikilink-строки "[[Note]]" или списки таких строк.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              filePath: { type: "string", description: "Путь к заметке" },
+              set: { type: "object", description: "Ключи/значения для установки" },
+              removeKeys: { type: "array", items: { type: "string" }, description: "Ключи для удаления" },
+              ensureMdExtension: { type: "boolean", default: true },
+              createMissingFolders: { type: "boolean", default: true }
+            },
+            required: ["filePath"]
+          }
+        },
+        {
+          name: "unlink-notes",
+          description: `🗑️ Удалить связь между двумя заметками. Работает симметрично при bidirectional=true.
+
+Режимы: property | body | both. Для body укажи heading, если секций несколько.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              fromPath: { type: "string", description: "Путь A" },
+              toPath: { type: "string", description: "Путь B" },
+              relation: { type: "string", description: "Имя свойства (для property)", default: "related" },
+              mode: { type: "string", enum: ["property", "body", "both"], default: "both" },
+              bidirectional: { type: "boolean", default: true },
+              heading: { type: "string", description: "Заголовок для body", default: "Relations" }
+            },
+            required: ["fromPath", "toPath"]
+          }
+        },
+        {
+          name: "reindex-vault",
+          description: `🔄 Проиндексировать все заметки во vault и обновить поисковый индекс (Fuse.js).
+
+Используй после массовых изменений/создания заметок. Возвращает количество заново проиндексированных заметок.`,
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false
           }
         }
       ]
@@ -1307,6 +1968,152 @@ Please check:
 
 ${content}`
           }
+        ]
+      };
+    }
+
+    if (request.params.name === "write-note") {
+      const args = request.params.arguments || {} as any;
+      const filePath = args.filePath as string;
+      const content = args.content as string;
+      const writeMode = (args.writeMode as 'create' | 'overwrite' | 'append') || 'create';
+      const heading = args.heading as (string | undefined);
+      const frontmatter = args.frontmatter as (Record<string, any> | undefined);
+      const ensureMdExtension = (args.ensureMdExtension as boolean) ?? true;
+      const createMissingFolders = (args.createMissingFolders as boolean) ?? true;
+
+      if (!filePath || !content) {
+        throw new Error("Missing required parameters: filePath, content");
+      }
+
+      const result = serverInstance!.writeNote({
+        filePath,
+        content,
+        writeMode,
+        heading,
+        frontmatter,
+        ensureMdExtension,
+        createMissingFolders
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Note written successfully\n\n- Path: ${result.relativePath}\n- Absolute: ${result.absolutePath}\n- Mode: ${writeMode}\n- Bytes: ${result.bytesWritten}\n- Created: ${result.created}\n- Overwritten: ${result.overwritten}\n- Appended: ${result.appended}`
+          }
+        ]
+      };
+    }
+
+    if (request.params.name === "append-under-heading") {
+      const args = request.params.arguments || {} as any;
+      const filePath = args.filePath as string;
+      const heading = args.heading as string;
+      const rawContent = args.content as string;
+      const bullet = (args.bullet as boolean) ?? false;
+      const timestamp = (args.timestamp as boolean) ?? false;
+      const ensureMdExtension = (args.ensureMdExtension as boolean) ?? true;
+      const createMissingFolders = (args.createMissingFolders as boolean) ?? true;
+
+      if (!filePath || !heading || !rawContent) {
+        throw new Error("Missing required parameters: filePath, heading, content");
+      }
+
+      const content = `${bullet ? '- ' : ''}${timestamp ? new Date().toISOString() + ' ' : ''}${rawContent}`;
+
+      const result = serverInstance!.writeNote({
+        filePath,
+        content,
+        writeMode: 'append',
+        heading,
+        ensureMdExtension,
+        createMissingFolders
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Appended under heading\n\n- Path: ${result.relativePath}\n- Heading: ${heading}\n- Bytes: ${result.bytesWritten}`
+          }
+        ]
+      };
+    }
+
+    if (request.params.name === "create-node") {
+      const args = request.params.arguments || {} as any;
+      const result = serverInstance!.createNode({
+        filePath: args.filePath,
+        title: args.title,
+        type: args.type,
+        properties: args.properties,
+        content: args.content,
+        ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+        createMissingFolders: (args.createMissingFolders as boolean) ?? true
+      });
+      return {
+        content: [
+          { type: "text", text: `✅ Node created at ${result.relativePath}` }
+        ]
+      };
+    }
+
+    if (request.params.name === "link-notes") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.linkNotes({
+        fromPath: args.fromPath,
+        toPath: args.toPath,
+        relation: args.relation || 'related',
+        mode: (args.mode as 'property' | 'body' | 'both') || 'both',
+        bidirectional: (args.bidirectional as boolean) ?? true,
+        heading: args.heading || 'Relations'
+      });
+      return {
+        content: [
+          { type: "text", text: `✅ Linked: ${res.fromPath} ⇄ ${res.toPath} (${res.mode}/${res.relation})` }
+        ]
+      };
+    }
+
+    if (request.params.name === "upsert-frontmatter") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.upsertFrontmatter({
+        filePath: args.filePath,
+        set: args.set,
+        removeKeys: args.removeKeys,
+        ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+        createMissingFolders: (args.createMissingFolders as boolean) ?? true
+      });
+      return {
+        content: [
+          { type: "text", text: `✅ Frontmatter updated: ${res.relativePath}` }
+        ]
+      };
+    }
+
+    if (request.params.name === "unlink-notes") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.unlinkNotes({
+        fromPath: args.fromPath,
+        toPath: args.toPath,
+        relation: args.relation || 'related',
+        mode: (args.mode as 'property' | 'body' | 'both') || 'both',
+        bidirectional: (args.bidirectional as boolean) ?? true,
+        heading: args.heading || 'Relations'
+      });
+      return {
+        content: [
+          { type: "text", text: `✅ Unlinked: ${args.fromPath} ↮ ${args.toPath} (${args.mode || 'both'}/${args.relation || 'related'})` }
+        ]
+      };
+    }
+
+    if (request.params.name === "reindex-vault") {
+      const res = await serverInstance!.reindexVault();
+      return {
+        content: [
+          { type: "text", text: `🔄 Reindexed notes: ${res.notes}` }
         ]
       };
     }
