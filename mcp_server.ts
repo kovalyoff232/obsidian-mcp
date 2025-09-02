@@ -1532,6 +1532,78 @@ class ObsidianMCPServer {
     try { this.indexSingleFile(relWithExt); } catch {}
   }
 
+  // ===== Helpers for graph/links =====
+  private normalizeNoteKey(key: string): string {
+    const base = key.replace(/\\/g, '/').split('/').pop() || key;
+    return base.replace(/\.md$/i, '').trim().toLowerCase();
+  }
+
+  private extractWikiLinks(content: string): string[] {
+    const result: string[] = [];
+    const regex = /\[\[([^\]]+)\]\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(content)) !== null) {
+      const raw = m[1].split('#')[0].trim();
+      if (raw) result.push(this.normalizeNoteKey(raw));
+    }
+    return [...new Set(result)];
+  }
+
+  private resolveNoteKeyToPath(key: string): string | null {
+    const norm = this.normalizeNoteKey(key);
+    // try exact path match
+    const byPath = this.indexData.find(n => this.normalizeNoteKey(n.path) === norm);
+    if (byPath) return byPath.path;
+    // try title match
+    const byTitle = this.indexData.find(n => this.normalizeNoteKey(n.title || '') === norm);
+    if (byTitle) return byTitle.path;
+    return null;
+  }
+
+  // removed private variant to avoid duplicate — public accessor added below
+
+  private getOutgoingPaths(fromPath: string): string[] {
+    const note = this.indexData.find(n => n.path === fromPath);
+    if (!note) return [];
+    const keys = this.extractWikiLinks((note.content || note.content_preview || ''));
+    const paths = keys.map(k => this.resolveNoteKeyToPath(k)).filter((p): p is string => !!p);
+    // also inspect frontmatter link-like arrays
+    const { frontmatter } = this.parseFrontmatterAndBody(note.content || '');
+    for (const [k, v] of Object.entries(frontmatter)) {
+      if (Array.isArray(v)) {
+        for (const item of v) {
+          if (typeof item === 'string' && /\[\[[^\]]+\]\]/.test(item)) {
+            const key = this.normalizeNoteKey(item.replace(/^\[\[|\]\]$/g, '').split('#')[0]);
+            const p = this.resolveNoteKeyToPath(key);
+            if (p) paths.push(p);
+          }
+        }
+      }
+    }
+    return [...new Set(paths)];
+  }
+
+  private getBacklinkPaths(toPath: string): string[] {
+    const targetKey = this.normalizeNoteKey(toPath);
+    const result = new Set<string>();
+    for (const n of this.indexData) {
+      const keys = this.extractWikiLinks(n.content || n.content_preview || '');
+      if (keys.includes(targetKey)) result.add(n.path);
+      const { frontmatter } = this.parseFrontmatterAndBody(n.content || '');
+      for (const v of Object.values(frontmatter)) {
+        if (Array.isArray(v)) {
+          for (const item of v) {
+            if (typeof item === 'string' && /\[\[[^\]]+\]\]/.test(item)) {
+              const key = this.normalizeNoteKey(item.replace(/^\[\[|\]\]$/g, '').split('#')[0]);
+              if (key === targetKey) result.add(n.path);
+            }
+          }
+        }
+      }
+    }
+    return [...result];
+  }
+
   private getNote(noteId: string): ObsidianNote | null {
     return this.indexData.find(note => 
       note.id === noteId || 
@@ -1568,6 +1640,19 @@ class ObsidianMCPServer {
       "testing": ["тест", "проверка", "testing"]
     };
   }
+
+  // Expose safe accessors for server usage
+  public getNotePathFromId(noteId: string): string | null {
+    const note = this.indexData.find(n => n.id === noteId || n.path === noteId || (n.title && n.title === noteId));
+    if (note) return note.path;
+    return this.resolveNoteKeyToPath(noteId);
+  }
+
+  public getOutgoingPathsPub(pathInput: string): string[] { return this.getOutgoingPaths(pathInput); }
+  public getBacklinkPathsPub(pathInput: string): string[] { return this.getBacklinkPaths(pathInput); }
+  public getIndexData(): ObsidianNote[] { return this.indexData; }
+  public getVaultRoot(): string { return this.vaultPath; }
+  public reindexFileIncremental(relPath: string): void { this.indexSingleFile(relPath); }
 }
 
 // Создаем и экспортируем функцию для создания MCP сервера
@@ -1842,6 +1927,46 @@ Frontmatter: можно передать объект ключ-значение 
             properties: {},
             additionalProperties: false
           }
+        },
+        {
+          name: "get-graph-summary",
+          description: `📊 Получить сводку графа по заметке: исходящие/входящие связи, с глубиной.
+
+Параметры: noteId, depth (1..3), direction (in|out|both), relation(optional для фильтрации).`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              noteId: { type: "string", description: "ID/путь/заголовок заметки" },
+              depth: { type: "number", description: "Глубина обхода", default: 1 },
+              direction: { type: "string", enum: ["in", "out", "both"], default: "both" },
+              relation: { type: "string", description: "Имя свойства для фильтрации (optional)" }
+            },
+            required: ["noteId"]
+          }
+        },
+        {
+          name: "find-unlinked-mentions",
+          description: `🧠 Найти нелинкованные упоминания терминов и предложить автолинки.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              terms: { type: "array", items: { type: "string" }, description: "Список терминов/названий" },
+              maxPerFile: { type: "number", default: 3 },
+              limitFiles: { type: "number", default: 30 }
+            },
+            required: ["terms"]
+          }
+        },
+        {
+          name: "reindex-changed-since",
+          description: `⏱️ Переиндексировать только изменённые со времени timestamp (ISO).`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              since: { type: "string", description: "ISO-время" }
+            },
+            required: ["since"]
+          }
         }
       ]
     };
@@ -1901,12 +2026,19 @@ Try:
     }
 
     if (request.params.name === "get-note-content") {
-      const noteId = request.params.arguments?.context7CompatibleLibraryID as string;
+      let noteId = request.params.arguments?.context7CompatibleLibraryID as string;
       const maxTokens = request.params.arguments?.tokens as number;
-      const topic = request.params.arguments?.topic as string;
+      let topic = request.params.arguments?.topic as string;
 
       if (!noteId) {
         throw new Error("Missing required parameter: context7CompatibleLibraryID");
+      }
+
+      // поддержка file#heading
+      if (noteId.includes('#') && !topic) {
+        const [base, head] = noteId.split('#');
+        noteId = base;
+        topic = head || topic;
       }
 
       const fullContent = serverInstance!.getFullNoteContent(noteId);
@@ -2116,6 +2248,122 @@ ${content}`
           { type: "text", text: `🔄 Reindexed notes: ${res.notes}` }
         ]
       };
+    }
+
+    if (request.params.name === "get-graph-summary") {
+      const args = request.params.arguments || {} as any;
+      const noteId = args.noteId as string;
+      const depth = Math.max(1, Math.min(3, (args.depth as number) || 1));
+      const direction = (args.direction as 'in'|'out'|'both') || 'both';
+      const relation = args.relation as (string|undefined);
+
+      const startPath = serverInstance!.getNotePathFromId(noteId);
+      if (!startPath) throw new Error(`Note not found: ${noteId}`);
+
+      const visited = new Set<string>();
+      const layers: string[][] = [];
+      let current = [startPath];
+      visited.add(startPath);
+
+      for (let d = 0; d < depth; d++) {
+        const next: string[] = [];
+        const layer: string[] = [];
+        for (const p of current) {
+          let outs: string[] = [];
+          let ins: string[] = [];
+          if (direction === 'out' || direction === 'both') outs = serverInstance!.getOutgoingPathsPub(p);
+          if (direction === 'in' || direction === 'both') ins = serverInstance!.getBacklinkPathsPub(p);
+          const all = [...outs, ...ins];
+          for (const q of all) {
+            if (!visited.has(q)) {
+              visited.add(q);
+              layer.push(q);
+              next.push(q);
+            }
+          }
+        }
+        if (layer.length > 0) layers.push(layer);
+        current = next;
+      }
+
+      const lines: string[] = [];
+      lines.push(`Root: ${startPath}`);
+      layers.forEach((layer, i) => {
+        lines.push(`Depth ${i+1}:`);
+        for (const p of layer) {
+          const n = serverInstance!.getIndexData().find(x => x.path === p);
+          const degOut = serverInstance!.getOutgoingPathsPub(p).length;
+          const degIn = serverInstance!.getBacklinkPathsPub(p).length;
+          lines.push(`- ${p} (${(n?.title)||''}) out:${degOut} in:${degIn}`);
+        }
+      });
+
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    if (request.params.name === "find-unlinked-mentions") {
+      const args = request.params.arguments || {} as any;
+      const terms: string[] = (args.terms as string[]) || [];
+      const maxPerFile = (args.maxPerFile as number) ?? 3;
+      const limitFiles = (args.limitFiles as number) ?? 30;
+
+      const patterns = terms.map(t => ({ term: t, re: new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') }));
+      const suggestions: string[] = [];
+      let filesCount = 0;
+      for (const n of serverInstance!.getIndexData()) {
+        // Игнор системных/плагинных путей
+        if (n.path.startsWith('.obsidian/') || n.path.includes('/node_modules/')) continue;
+        if (filesCount >= limitFiles) break;
+        const text = (n.content || n.content_preview || '');
+        let hits = 0;
+        for (const { term, re } of patterns) {
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(text)) !== null) {
+            const idx = m.index;
+            const before = text.slice(Math.max(0, idx - 2), idx);
+            if (before === '[[') continue; // уже линк
+            const start = Math.max(0, idx - 40);
+            const end = Math.min(text.length, idx + term.length + 40);
+            const snippet = text.slice(start, end).replace(/\n/g, ' ');
+            suggestions.push(`- ${n.path}: …${snippet}…`);
+            hits++;
+            if (hits >= maxPerFile) break;
+          }
+          if (hits >= maxPerFile) break;
+        }
+        if (hits > 0) filesCount++;
+      }
+
+      const outText = suggestions.length ? suggestions.join('\n') : 'No unlinked mentions found';
+      return { content: [{ type: 'text', text: outText }] };
+    }
+
+    if (request.params.name === "reindex-changed-since") {
+      const args = request.params.arguments || {} as any;
+      const sinceIso = args.since as string;
+      const since = new Date(sinceIso).getTime();
+      if (Number.isNaN(since)) throw new Error('Invalid ISO date');
+
+      const vaultRoot = path.resolve(serverInstance!.getVaultRoot());
+      let changed = 0;
+      const walk = (dir: string) => {
+        const entries = readdirSync(dir);
+        for (const entry of entries) {
+          const full = path.join(dir, entry);
+          const st = statSync(full);
+          if (st.isDirectory()) walk(full);
+          else if (st.isFile() && entry.toLowerCase().endsWith('.md')) {
+            if (st.mtimeMs >= since) {
+              const rel = path.relative(vaultRoot, full).replace(/\\/g, '/');
+              serverInstance!.reindexFileIncremental(rel);
+              changed++;
+            }
+          }
+        }
+      };
+      walk(vaultRoot);
+
+      return { content: [{ type: 'text', text: `Delta reindexed: ${changed}` }] };
     }
 
     throw new Error(`Unknown tool: ${request.params.name}`);
