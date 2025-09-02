@@ -102,3 +102,4 @@ jspm_packages/
 # DynamoDB Local files
 .dynamodb/
 update_plan.md
+/index.json
