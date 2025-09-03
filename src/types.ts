@@ -3,7 +3,7 @@ export interface MCPSettings {
     python_path: string;
     embedding_model: string;
     excluded_folders: string[];
-    search_default_mode?: 'balanced' | 'taxonomy';
+    search_default_mode?: 'balanced' | 'taxonomy' | 'semantic';
     search_include_linked_default?: boolean;
     search_limit_default?: number;
 }

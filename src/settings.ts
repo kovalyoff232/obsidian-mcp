@@ -66,6 +66,7 @@ export class MCPSettingsTab extends PluginSettingTab {
             .addDropdown(drop => drop
                 .addOption('balanced', 'balanced')
                 .addOption('taxonomy', 'taxonomy')
+                .addOption('semantic', 'semantic')
                 .setValue(this.plugin.settings.search_default_mode || 'balanced')
                 .onChange(async (value) => {
                     this.plugin.settings.search_default_mode = value as any;

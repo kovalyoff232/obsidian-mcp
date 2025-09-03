@@ -445,20 +445,21 @@ class ObsidianMCPServer {
   }
 
   // Инициализируем Fuse.js для мощного fuzzy поиска
-  private initializeFuse(mode: 'balanced' | 'taxonomy' = 'balanced'): void {
+  private initializeFuse(mode: 'balanced' | 'taxonomy' | 'semantic' = 'balanced'): void {
     const isTaxonomy = mode === 'taxonomy';
+    const isSemantic = mode === 'semantic';
     const fuseOptions = {
       keys: [
-        { name: 'title', weight: isTaxonomy ? 0.6 : 0.5 },
-        { name: 'content', weight: isTaxonomy ? 0.2 : 0.3 },
+        { name: 'title', weight: isTaxonomy ? 0.6 : (isSemantic ? 0.3 : 0.5) },
+        { name: 'content', weight: isTaxonomy ? 0.2 : (isSemantic ? 0.5 : 0.3) },
         { name: 'description', weight: 0.15 },
         { name: 'path', weight: 0.05 },
         { name: 'tags', weight: isTaxonomy ? 0.1 : 0.05 },
         { name: 'aliases', weight: 0.2 },
         { name: 'type', weight: isTaxonomy ? 0.09 : 0.05 }
       ],
-      threshold: isTaxonomy ? 0.28 : 0.25,
-      distance: 30,
+      threshold: isTaxonomy ? 0.28 : (isSemantic ? 0.35 : 0.25),
+      distance: isSemantic ? 50 : 30,
       minMatchCharLength: 3,
       useExtendedSearch: true,
       ignoreLocation: true,
@@ -1222,13 +1223,30 @@ class ObsidianMCPServer {
         const smartSnippet = this.extractRelevantSnippet(originalContent, normalizedQuery || query, 300);
         const highlightedSnippet = this.highlightMatches(smartSnippet, normalizedQuery || query);
         
+        // Дополнительная семантическая корректировка (эвристика):
+        let finalScore = score;
+        if ((mode as any) === 'semantic') {
+          const qWords = this.extractQueryWords(normalizedQuery || query);
+          let matches = 0;
+          const lc = (originalContent || '').toLowerCase();
+          for (const w of qWords) {
+            if (!w || w.length < 2) continue;
+            const re = new RegExp(this.escapeRegex(w), 'g');
+            const m = lc.match(re);
+            if (m) matches += Math.min(5, m.length);
+          }
+          const sem = matches > 0 ? Math.min(0.25, 0.7 / (matches + 1)) : 0.7;
+          finalScore = Math.min(score, sem);
+          if (finalScore < score) confidence = 'high';
+        }
+
         return {
           id: note.id || 'unknown',
           title: this.highlightMatches(note.title || 'Untitled', normalizedQuery || query), // 🎯 Highlighting в заголовке!
           description: this.highlightMatches(note.description || '', normalizedQuery || query), // 🎯 Highlighting в описании!
           path: note.path,
           lastModified: note.lastModified || '',
-          score,
+          score: finalScore,
           type,
           content_preview: highlightedSnippet, // 🎯 Умный snippet с highlighting!
           tags: note.tags,

@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z)
+        required: true
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Calculate checksums
+        run: |
+          mkdir -p artifacts
+          cp -r dist artifacts/dist
+          (cd artifacts && find dist -type f -print0 | xargs -0 -I{} sh -c 'sha256sum "{}" >> SHA256SUMS.txt')
+          echo "Checksums:" && cat artifacts/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          name: ${{ github.ref_name || inputs.tag }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/SHA256SUMS.txt
+            artifacts/dist/mcp_server.js
+            artifacts/dist/src/*.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
