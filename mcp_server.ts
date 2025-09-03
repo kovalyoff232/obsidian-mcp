@@ -215,6 +215,17 @@ class ObsidianMCPServer {
 
   constructor() {
     this.synonyms = this._loadSynonyms();
+    // Подмешиваем пользовательские синонимы из vault (если найдём)
+    try {
+      const userSyn = this._loadUserSynonymsFromVault();
+      if (userSyn && Object.keys(userSyn).length > 0) {
+        for (const [k, arr] of Object.entries(userSyn)) {
+          const base = this.synonyms[k] || [];
+          this.synonyms[k] = [...new Set([...base, ...arr])];
+        }
+        console.error(`🧩 User synonyms merged: +${Object.keys(userSyn).length} entries`);
+      }
+    } catch {}
     this.categories = this._initCategories();
     this.vaultPath = this.findVaultPath();
   }
@@ -434,26 +445,33 @@ class ObsidianMCPServer {
   }
 
   // Инициализируем Fuse.js для мощного fuzzy поиска
-  private initializeFuse(): void {
+  private initializeFuse(mode: 'balanced' | 'taxonomy' = 'balanced'): void {
+    const isTaxonomy = mode === 'taxonomy';
     const fuseOptions = {
       keys: [
-        { name: 'title', weight: 0.5 },           // Заголовок
-        { name: 'content', weight: 0.3 },         // Полный контент
-        { name: 'description', weight: 0.15 },    // Описание
-        { name: 'path', weight: 0.05 },           // Путь
-        { name: 'tags', weight: 0.05 },           // Теги
-        { name: 'aliases', weight: 0.2 },         // Алиасы из фронтматтера
-        { name: 'type', weight: 0.05 }            // Тип ноды
+        { name: 'title', weight: isTaxonomy ? 0.6 : 0.5 },
+        { name: 'content', weight: isTaxonomy ? 0.2 : 0.3 },
+        { name: 'description', weight: 0.15 },
+        { name: 'path', weight: 0.05 },
+        { name: 'tags', weight: isTaxonomy ? 0.1 : 0.05 },
+        { name: 'aliases', weight: 0.2 },
+        { name: 'type', weight: isTaxonomy ? 0.09 : 0.05 }
       ],
-      threshold: 0.25,
-      distance: 20,
+      threshold: isTaxonomy ? 0.28 : 0.25,
+      distance: 30,
       minMatchCharLength: 3,
       useExtendedSearch: true,
-      ignoreLocation: true
+      ignoreLocation: true,
+      getFn: (obj: any, pathKey: string) => {
+        const val: any = (Fuse as any).config.getFn(obj, pathKey);
+        if (typeof val === 'string') return this.normalizeQuery(val);
+        if (Array.isArray(val)) return val.map(v => typeof v === 'string' ? this.normalizeQuery(v) : v);
+        return val;
+      }
     };
 
-    this.fuse = new Fuse(this.indexData, fuseOptions);
-    console.error(`🔧 Fuse.js initialized with ${this.indexData.length} searchable notes`);
+    this.fuse = new Fuse(this.indexData, fuseOptions as any);
+    console.error(`🔧 Fuse.js initialized [mode=${mode}] with ${this.indexData.length} searchable notes`);
   }
 
   // Инкрементальная индексация одного файла
@@ -511,8 +529,11 @@ class ObsidianMCPServer {
 
   // Расширяем поисковый запрос синонимами
   private expandQueryWithSynonyms(query: string): string[] {
-    const expandedQueries = [query.toLowerCase()];
-    const queryLower = query.toLowerCase();
+    const expandedQueries: string[] = [];
+    const queryLower = (query || '').toLowerCase();
+    expandedQueries.push(queryLower);
+    const normalized = this.normalizeQuery(queryLower);
+    if (normalized && normalized !== queryLower) expandedQueries.push(normalized);
 
     // Добавляем синонимы из словаря
     for (const [key, synonyms] of Object.entries(this.synonyms)) {
@@ -523,7 +544,7 @@ class ObsidianMCPServer {
     }
 
     // Убираем дубликаты и возвращаем уникальные запросы
-    return [...new Set(expandedQueries)];
+    return [...new Set(expandedQueries.filter(Boolean))];
   }
 
   // 🎯 НОВАЯ ФИЧА: Подсвечиваем найденные слова в тексте!
@@ -548,10 +569,11 @@ class ObsidianMCPServer {
 
   // Извлекаем слова из запроса для подсветки
   private extractQueryWords(query: string): string[] {
-    const words = query.toLowerCase()
-      .split(/[\s\-_.,;:!?()[\]{}"']+/) // Разбиваем по разделителям
-      .filter(word => word.length >= 2)  // Только слова от 2 символов
-      .filter(word => !/^\d+$/.test(word)); // Исключаем чисто числовые
+    const words = (query || '').toLowerCase()
+      .split(/[\s\-_.,;:!?()[\]{}"']+/)
+      .filter(word => word.length >= 2)
+      .filter(word => !/^\d+$/.test(word))
+      .map(w => this.normalizeWord(w));
 
     // Добавляем синонимы для найденных слов
     const expandedWords = [...words];
@@ -563,12 +585,34 @@ class ObsidianMCPServer {
       }
     }
 
-    return [...new Set(expandedWords)]; // Убираем дубликаты
+    return [...new Set(expandedWords.filter(Boolean))];
   }
 
   // Экранируем специальные символы для regex
   private escapeRegex(str: string): string {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  // --- Новая морфология: нормализация RU/EN ---
+  private normalizeWord(word: string): string {
+    if (!word) return word;
+    let w = word.toLowerCase();
+    if (/^\d+$/.test(w)) return w;
+    const enSuffixes = ['ing','edly','ed','es','s','ly','ment','ness','ation','ions','ion','er','ers'];
+    for (const suf of enSuffixes) {
+      if (w.endsWith(suf) && w.length - suf.length >= 3) { w = w.slice(0, -suf.length); break; }
+    }
+    const ruSuffixes = ['иями','ями','ами','ыми','ими','ого','ему','ому','ее','ие','ые','ая','яя','ою','ею','ую','ью','ой','ый','ий','ых','ов','ев','ам','ям','ах','ях','ом','ем','ую','ию','ясь','ешь','ишь','ить','ать','ять','ывать','ивать','ение','ений','ениям','ениями','енией','овать'];
+    for (const suf of ruSuffixes) {
+      if (w.endsWith(suf) && w.length - suf.length >= 3) { w = w.slice(0, -suf.length); break; }
+    }
+    return w;
+  }
+
+  private normalizeQuery(query: string): string {
+    const parts = (query || '').toLowerCase().split(/[\s\-_.,;:!?()[\]{}"']+/).filter(Boolean);
+    const normalized = parts.map(p => this.normalizeWord(p));
+    return Array.from(new Set(normalized)).join(' ');
   }
 
   // 🔍 Умно извлекаем контекст вокруг найденных слов
@@ -1078,7 +1122,9 @@ class ObsidianMCPServer {
   }
 
   // ИДЕАЛЬНЫЙ ПОИСК с Fuse.js!
-  public searchNotes(query: string, limit: number = DEFAULT_LIMIT): SearchResult[] {
+  public searchNotes(query: string, limit: number = DEFAULT_LIMIT, options?: { mode?: 'balanced'|'taxonomy', includeLinked?: boolean }): SearchResult[] {
+    const mode = options?.mode || 'balanced';
+    const includeLinked = options?.includeLinked !== false;
     if (!this.fuse || !this.indexData || this.indexData.length === 0) {
       console.error(`❌ Search engine not initialized`);
       return [];
@@ -1094,7 +1140,8 @@ class ObsidianMCPServer {
       return cachedResults;
     }
 
-    console.error(`🔍 Searching: "${query}" in ${this.indexData.length} notes`);
+    this.initializeFuse(mode);
+    console.error(`🔍 Searching: "${query}" in ${this.indexData.length} notes [mode=${mode}]`);
     
     // 🔍 ПАРСИМ РАСШИРЕННЫЕ ОПЕРАТОРЫ!
     const parsedQuery = QueryParser.parse(query);
@@ -1171,13 +1218,14 @@ class ObsidianMCPServer {
 
         // 🎯 HIGHLIGHTING И УМНОЕ ИЗВЛЕЧЕНИЕ КОНТЕКСТА!
         const originalContent = note.content || '';
-        const smartSnippet = this.extractRelevantSnippet(originalContent, query, 300);
-        const highlightedSnippet = this.highlightMatches(smartSnippet, query);
+        const normalizedQuery = this.normalizeQuery(query);
+        const smartSnippet = this.extractRelevantSnippet(originalContent, normalizedQuery || query, 300);
+        const highlightedSnippet = this.highlightMatches(smartSnippet, normalizedQuery || query);
         
         return {
           id: note.id || 'unknown',
-          title: this.highlightMatches(note.title || 'Untitled', query), // 🎯 Highlighting в заголовке!
-          description: this.highlightMatches(note.description || '', query), // 🎯 Highlighting в описании!
+          title: this.highlightMatches(note.title || 'Untitled', normalizedQuery || query), // 🎯 Highlighting в заголовке!
+          description: this.highlightMatches(note.description || '', normalizedQuery || query), // 🎯 Highlighting в описании!
           path: note.path,
           lastModified: note.lastModified || '',
           score,
@@ -1204,7 +1252,7 @@ class ObsidianMCPServer {
     }
     
     // 🔗 Добавляем связанные заметки к результатам!
-    const enhancedResults = this.searchWithLinks(query, filteredResults, true);
+    const enhancedResults = this.searchWithLinks(query, filteredResults, includeLinked);
     
     console.error(`🔗 Enhanced with linked notes: ${enhancedResults.length} total results (${enhancedResults.length - filteredResults.length} linked notes added)`);
     
@@ -1876,6 +1924,45 @@ class ObsidianMCPServer {
     };
   }
 
+  // Попытка загрузить пользовательские синонимы из заметок vault
+  private _loadUserSynonymsFromVault(): Record<string, string[]> {
+    try {
+      const candidates = this.indexData.filter(n => {
+        const p = (n.path || '').toLowerCase();
+        const t = (n.title || '').toLowerCase();
+        return p.endsWith('synonyms.md') || p.includes('синоним') || t.includes('synonyms') || t.includes('синоним');
+      });
+      const merged: Record<string, string[]> = {};
+      for (const note of candidates) {
+        const content = (note.content || note.content_preview || '');
+        const jsonMatch = content.match(/```json\n([\s\S]*?)\n```/i);
+        if (jsonMatch) {
+          try {
+            const obj = JSON.parse(jsonMatch[1]);
+            for (const [k, v] of Object.entries(obj)) {
+              const key = String(k).toLowerCase();
+              const arr = Array.isArray(v) ? v.map(x => String(x).toLowerCase().trim()).filter(Boolean) : [];
+              merged[key] = [...new Set([...(merged[key] || []), ...arr])];
+            }
+          } catch {}
+        }
+        const lines = content.split('\n');
+        for (const line of lines) {
+          const m = line.match(/^\s*([^:#]+)\s*:\s*([^#]+)$/);
+          if (!m) continue;
+          const key = m[1].trim().toLowerCase();
+          const vals = m[2].split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+          if (key && vals.length > 0) {
+            merged[key] = [...new Set([...(merged[key] || []), ...vals])];
+          }
+        }
+      }
+      return merged;
+    } catch {
+      return {};
+    }
+  }
+
   private _initCategories(): Record<string, string[]> {
     return {
       "programming": ["код", "функция", "класс", "переменная", "массив"],
@@ -2498,6 +2585,10 @@ Frontmatter: можно передать объект ключ-значение 
       if (!query) {
         throw new Error("Missing required parameter: libraryName");
       }
+      const args = request.params.arguments || {} as any;
+      const limit = Number(args.limit) || 20;
+      const mode = (args.mode as any) || 'balanced';
+      const includeLinked = args.includeLinked !== false;
 
       // Поддержка пресетов: если строка начинается с preset:, заменяем на шаблон
       if (query.startsWith('preset:')) {
@@ -2511,7 +2602,7 @@ Frontmatter: можно передать объект ключ-значение 
         }
       }
 
-      const results = serverInstance!.searchNotes(query);
+      const results = serverInstance!.searchNotes(query, limit, { mode, includeLinked });
       
       // Форматируем результаты для отображения
       const formattedContent = results.length > 0 ? 

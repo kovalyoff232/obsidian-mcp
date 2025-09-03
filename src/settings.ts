@@ -59,5 +59,39 @@ export class MCPSettingsTab extends PluginSettingTab {
                     this.plugin.settings.excluded_folders = value.split('\n').map(v => v.trim()).filter(v => v);
                     await this.plugin.saveSettings();
                 }));
+
+        new Setting(containerEl)
+            .setName('Search default mode')
+            .setDesc('Fuse ranking profile: balanced or taxonomy')
+            .addDropdown(drop => drop
+                .addOption('balanced', 'balanced')
+                .addOption('taxonomy', 'taxonomy')
+                .setValue(this.plugin.settings.search_default_mode || 'balanced')
+                .onChange(async (value) => {
+                    this.plugin.settings.search_default_mode = value as any;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Include linked notes by default')
+            .setDesc('When enabled, search results may include linked notes')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.search_include_linked_default ?? true)
+                .onChange(async (value) => {
+                    this.plugin.settings.search_include_linked_default = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Default search limit')
+            .setDesc('How many items to return by default')
+            .addText(text => text
+                .setPlaceholder('e.g. 20')
+                .setValue(String(this.plugin.settings.search_limit_default ?? 20))
+                .onChange(async (value) => {
+                    const n = Number(value);
+                    this.plugin.settings.search_limit_default = isNaN(n) ? 20 : n;
+                    await this.plugin.saveSettings();
+                }));
     }
 }

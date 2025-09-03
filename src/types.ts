@@ -3,6 +3,9 @@ export interface MCPSettings {
     python_path: string;
     embedding_model: string;
     excluded_folders: string[];
+    search_default_mode?: 'balanced' | 'taxonomy';
+    search_include_linked_default?: boolean;
+    search_limit_default?: number;
 }
 
 export const DEFAULT_SETTINGS: MCPSettings = {
@@ -24,6 +27,9 @@ export const DEFAULT_SETTINGS: MCPSettings = {
         '.obsidian/plugins/obsidian-mcp-plugin/onnx',
         '.obsidian/plugins/obsidian-mcp-plugin/openvino'
     ],
+    search_default_mode: 'balanced',
+    search_include_linked_default: true,
+    search_limit_default: 20,
 };
 
 export interface IndexedFile {
