@@ -213,6 +213,11 @@ class ObsidianMCPServer {
     linkedNotesFound: 0
   };
 
+  // 🔤 Морфология: динамические стеммеры (если доступны в окружении)
+  private stemLibsInitialized: boolean = false;
+  private ruStemFn?: (word: string) => string;
+  private enStemFn?: (word: string) => string;
+
   constructor() {
     this.synonyms = this._loadSynonyms();
     // Подмешиваем пользовательские синонимы из vault (если найдём)
@@ -228,6 +233,8 @@ class ObsidianMCPServer {
     } catch {}
     this.categories = this._initCategories();
     this.vaultPath = this.findVaultPath();
+    // Инициализируем внешние стеммеры в фоне (не блокируем запуск)
+    this.initStemLibsAsync();
   }
 
   // Готовые пресеты сложных запросов
@@ -599,11 +606,25 @@ class ObsidianMCPServer {
     if (!word) return word;
     let w = word.toLowerCase();
     if (/^\d+$/.test(w)) return w;
-    const enSuffixes = ['ing','edly','ed','es','s','ly','ment','ness','ation','ions','ion','er','ers'];
+    // Попытка использовать внешние стеммеры, если они доступны
+    const hasCyrillic = /[\u0400-\u04FF]/.test(w);
+    try {
+      if (hasCyrillic && this.ruStemFn) {
+        const stemmed = this.ruStemFn(w);
+        if (typeof stemmed === 'string' && stemmed.length >= 2) return stemmed;
+      }
+      if (!hasCyrillic && this.enStemFn) {
+        const stemmed = this.enStemFn(w);
+        if (typeof stemmed === 'string' && stemmed.length >= 2) return stemmed;
+      }
+    } catch {}
+
+    // Фолбэк: ручной набор суффиксов
+    const enSuffixes = ['ingly','edly','ments','ations','ation','ingly','edly','ment','ness','ingly','ing','edly','ed','ions','ion','ers','er','es','ly','s'];
     for (const suf of enSuffixes) {
       if (w.endsWith(suf) && w.length - suf.length >= 3) { w = w.slice(0, -suf.length); break; }
     }
-    const ruSuffixes = ['иями','ями','ами','ыми','ими','ого','ему','ому','ее','ие','ые','ая','яя','ою','ею','ую','ью','ой','ый','ий','ых','ов','ев','ам','ям','ах','ях','ом','ем','ую','ию','ясь','ешь','ишь','ить','ать','ять','ывать','ивать','ение','ений','ениям','ениями','енией','овать'];
+    const ruSuffixes = ['иями','ями','ами','ыми','ими','кого','кому','ому','его','ему','ого','ее','ие','ые','ая','яя','ою','ею','ую','ью','ой','ый','ий','ых','ов','ев','ам','ям','ах','ях','ом','ем','ую','ию','ешь','ишь','ать','ять','ить','ешься','ишься','аться','яться','итьcя','иваться','ываться','овать','ирование','ированн','ирование','ение','ений','ениям','ениями','енией'];
     for (const suf of ruSuffixes) {
       if (w.endsWith(suf) && w.length - suf.length >= 3) { w = w.slice(0, -suf.length); break; }
     }
@@ -614,6 +635,46 @@ class ObsidianMCPServer {
     const parts = (query || '').toLowerCase().split(/[\s\-_.,;:!?()[\]{}"']+/).filter(Boolean);
     const normalized = parts.map(p => this.normalizeWord(p));
     return Array.from(new Set(normalized)).join(' ');
+  }
+
+  // Ленивая инициализация внешних стеммеров (если они установлены как зависимости)
+  private initStemLibsAsync(): void {
+    if (this.stemLibsInitialized) return;
+    this.stemLibsInitialized = true;
+    // Английский: natural.PorterStemmer
+    const natPkg = 'natural';
+    (import(natPkg as any) as any).then((mod: any) => {
+      try {
+        const ps = mod?.PorterStemmer;
+        if (ps && typeof ps.stem === 'function') {
+          this.enStemFn = (w: string) => {
+            try { return ps.stem(w); } catch { return w; }
+          };
+          console.error('✅ EN stemmer (natural) initialized');
+        }
+      } catch {}
+    }).catch(() => {});
+    // Русский: попытаться несколько популярных пакетов
+    const ruCandidates = [
+      'russian-porter-stemmer',
+      'russian-stemmer',
+      'stemmer-ru',
+      '@nlpjs/lang-ru'
+    ];
+    for (const pkg of ruCandidates) {
+      import(pkg as any).then((mod: any) => {
+        try {
+          let fn: ((w: string) => string) | undefined;
+          if (typeof mod?.stem === 'function') fn = mod.stem;
+          else if (typeof mod?.default === 'function') fn = mod.default;
+          else if (mod?.default && typeof mod.default.stem === 'function') fn = mod.default.stem;
+          if (fn) {
+            this.ruStemFn = (w: string) => { try { return fn!(w); } catch { return w; } };
+            console.error(`✅ RU stemmer initialized from ${pkg}`);
+          }
+        } catch {}
+      }).catch(() => {});
+    }
   }
 
   // 🔍 Умно извлекаем контекст вокруг найденных слов

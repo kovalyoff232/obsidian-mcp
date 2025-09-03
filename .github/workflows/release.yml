@@ -17,6 +17,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -28,12 +31,36 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Run bench (sanity)
+        run: |
+          node -v
+          npm -v
+          npm run bench || echo "Bench failed (non-blocking)"
+
       - name: Calculate checksums
         run: |
           mkdir -p artifacts
           cp -r dist artifacts/dist
           (cd artifacts && find dist -type f -print0 | xargs -0 -I{} sh -c 'sha256sum "{}" >> SHA256SUMS.txt')
           echo "Checksums:" && cat artifacts/SHA256SUMS.txt
+
+      - name: Generate SLSA provenance (attestation)
+        uses: slsa-framework/slsa-github-generator/.github/actions/generator@v2.0.0
+        with:
+          base64-subjects: |
+            $(cat artifacts/SHA256SUMS.txt | awk '{print $1":"$2}' | base64 -w0)
+        id: slsa
+
+      - name: Cosign sign checksums
+        if: env.COSIGN_PRIVATE_KEY
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          echo "$COSIGN_PRIVATE_KEY" | base64 -d > cosign.key
+          cosign sign-blob --key cosign.key --output-signature artifacts/SHA256SUMS.txt.sig artifacts/SHA256SUMS.txt
+          rm -f cosign.key
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -44,6 +71,7 @@ jobs:
           prerelease: false
           files: |
             artifacts/SHA256SUMS.txt
+            artifacts/SHA256SUMS.txt.sig
             artifacts/dist/mcp_server.js
             artifacts/dist/src/*.js
         env:

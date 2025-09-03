@@ -1,0 +1,19 @@
+[
+  {
+    "query": "обновить релиз checksum",
+    "mode": "balanced",
+    "includeLinked": true,
+    "expectedPaths": [
+      "graph/Dev Hub/Проекты/Obsidian MCP Plugin/Задачи/CI релизы и checksum/CI релизы и checksum.md"
+    ]
+  },
+  {
+    "query": "лемматизация RU EN",
+    "mode": "semantic",
+    "includeLinked": true,
+    "expectedPaths": [
+      "graph/Dev Hub/Проекты/Obsidian MCP Plugin/Задачи/Полноценная морфология RU-EN/Полноценная морфология RU-EN.md"
+    ]
+  }
+]
+
