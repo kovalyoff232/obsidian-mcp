@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { fileURLToPath } from "url";
 import path from "path";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, statSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, statSync, rmSync } from "fs";
 import Fuse from "fuse.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -28,6 +28,8 @@ interface ObsidianNote {
   links?: string[];
   size?: number;
   fullPath?: string; // Полный путь к оригинальному файлу для чтения всего содержимого
+  aliases?: string[];
+  type?: string;
 }
 
 // 🔍 РАСШИРЕННЫЕ ОПЕРАТОРЫ ПОИСКА (как в Google!)
@@ -63,22 +65,24 @@ class QueryParser {
       operators: []
     };
 
-    // Извлекаем точные фразы в кавычках
-    const phraseRegex = /"([^"]+)"/g;
+    // СНАЧАЛА извлекаем поиск по полям (title:значение, path:значение, tags:значение), поддерживаем кавычки
+    // Примеры: title:Антидепрессанты, title:"Анти депрессанты"
+    const fieldRegex = /([\w\.]+):(?:"([^"]+)"|([^\s]+))/g; // поддержка fm.key
     let match;
-    while ((match = phraseRegex.exec(query)) !== null) {
-      result.exactPhrases.push(match[1].toLowerCase());
-      query = query.replace(match[0], ''); // Удаляем обработанную фразу
+    while ((match = fieldRegex.exec(query)) !== null) {
+      const field = (match[1] || '').toLowerCase();
+      const value = (match[2] || match[3] || '').toLowerCase();
+      if (field && value) {
+        result.fieldQueries.push({ field, value });
+      }
+      query = query.replace(match[0], ''); // Удаляем обработанную часть
     }
 
-    // Извлекаем поиск по полям (title:значение, path:значение, tags:значение)
-    const fieldRegex = /(\w+):(\S+)/g;
-    while ((match = fieldRegex.exec(query)) !== null) {
-      result.fieldQueries.push({
-        field: match[1].toLowerCase(),
-        value: match[2].toLowerCase()
-      });
-      query = query.replace(match[0], ''); // Удаляем обработанную часть
+    // Затем извлекаем точные фразы в кавычках, оставшиеся вне field-запросов
+    const phraseRegex = /"([^"]+)"/g;
+    while ((match = phraseRegex.exec(query)) !== null) {
+      result.exactPhrases.push((match[1] || '').toLowerCase());
+      query = query.replace(match[0], '');
     }
 
     // Разбиваем оставшийся запрос на слова
@@ -215,6 +219,36 @@ class ObsidianMCPServer {
     this.vaultPath = this.findVaultPath();
   }
 
+  // Готовые пресеты сложных запросов
+  public getQueryPresets(): Record<string, string> {
+    return {
+      // Структура/таксономия
+      'classes:all': 'type:class',
+      'taxonomy:all': 'tags:taxonomy',
+      'taxonomy:drugs': 'tags:"drug-class"',
+
+      // Фармакология
+      'pharma:antidepressants': 'path:Антидепрессанты',
+      'pharma:ssri': '+SSRI fm.taxonomy:"Антидепрессанты"',
+      'pharma:ai-drafts': 'fm.source:ai fm.type:class path:Фармакология',
+
+      // Obsidian/инструменты
+      'obsidian:plugins': 'path:graph/ Knowledge Hub/ Инструменты/ Шаблонизация/ Плагины',
+      'obsidian:templating': 'path:Шаблонизация related:Templater',
+
+      // Качество/черновики
+      'drafts:ai': 'fm.source:ai status:draft',
+      'drafts:non-ai': '-fm.source:ai status:draft',
+
+      // Дедуп/диагностика
+      'diagnostics:has-hub-link': 'content:"[[Knowledge Hub]]" -type:class',
+      'diagnostics:leaf-direct-hub': 'related:"Knowledge Hub" -type:class',
+
+      // Навигация по алиасам
+      'aliases:antidepressants': 'aliases:"Antidepressants"',
+    };
+  }
+
   loadIndexSync() {
     if (this.isLoaded) return;
     
@@ -249,16 +283,28 @@ class ObsidianMCPServer {
           throw new Error('Index data is not an array');
         }
         
-        this.indexData = rawData.map((item, index) => ({
-          ...item,
-          id: item.id || `note_${index}`,
-          title: item.title || path.basename(item.path, '.md'),
-          description: item.description || item.content_preview?.substring(0, 150) || '',
-          lastModified: item.lastModified || new Date().toISOString(),
-          tags: item.tags || [],
-          links: item.links || [],
-          fullPath: path.join(this.vaultPath, item.path) // Добавляем полный путь к файлу
-        }));
+        const shouldExclude = (p: string) => {
+          const lp = (p || '').toLowerCase();
+          return lp.startsWith('.obsidian/') || lp.includes('/.obsidian/') ||
+                 lp.includes('/node_modules/') || lp.startsWith('node_modules/') ||
+                 lp.includes('/.venv/') || lp.startsWith('.venv/') ||
+                 lp.includes('/venv/') || lp.startsWith('venv/') ||
+                 lp.includes('/dist/') || lp.startsWith('dist/') ||
+                 lp.includes('/build/') || lp.startsWith('build/');
+        };
+
+        this.indexData = rawData
+          .filter((item: any) => !shouldExclude(item.path))
+          .map((item, index) => ({
+            ...item,
+            id: item.id || `note_${index}`,
+            title: item.title || path.basename(item.path, '.md'),
+            description: item.description || item.content_preview?.substring(0, 150) || '',
+            lastModified: item.lastModified || new Date().toISOString(),
+            tags: item.tags || [],
+            links: item.links || [],
+            fullPath: path.join(this.vaultPath, item.path) // Добавляем полный путь к файлу
+          }));
         
         // Загружаем полное содержимое всех заметок для лучшего поиска
         await this.loadFullContent();
@@ -290,6 +336,25 @@ class ObsidianMCPServer {
       if (note.fullPath && existsSync(note.fullPath)) {
         try {
           note.content = readFileSync(note.fullPath, 'utf-8');
+          // 🔎 Parse frontmatter tags into in-memory index for tags: filtering
+          try {
+            const { frontmatter } = this.parseFrontmatterAndBody(note.content || '');
+            const fmTags = (frontmatter && frontmatter['tags']) as any;
+            if (Array.isArray(fmTags)) {
+              note.tags = fmTags.map((t: any) => String(t));
+            } else if (typeof fmTags === 'string' && fmTags.trim().length > 0) {
+              note.tags = fmTags.split(/[\s,]+/).filter(Boolean);
+            }
+            const fmAliases = (frontmatter && frontmatter['aliases']) as any;
+            if (Array.isArray(fmAliases)) {
+              note.aliases = fmAliases.map((t: any) => String(t));
+            } else if (typeof fmAliases === 'string' && fmAliases.trim().length > 0) {
+              note.aliases = fmAliases.split(/[\s,]+/).filter(Boolean);
+            }
+            if (typeof frontmatter?.['type'] === 'string') {
+              note.type = frontmatter['type'];
+            }
+          } catch {}
         } catch (error) {
           console.error(`❌ Failed to read ${note.fullPath}:`, error);
           // Используем preview если не можем прочитать полный файл
@@ -310,15 +375,28 @@ class ObsidianMCPServer {
     const vaultRoot = path.resolve(this.vaultPath);
     const collected: ObsidianNote[] = [];
 
+    const shouldExclude = (relPath: string): boolean => {
+      const lp = (relPath || '').toLowerCase();
+      return lp.startsWith('.obsidian/') || lp.includes('/.obsidian/') ||
+             lp.startsWith('node_modules/') || lp.includes('/node_modules/') ||
+             lp.startsWith('.venv/') || lp.includes('/.venv/') ||
+             lp.startsWith('venv/') || lp.includes('/venv/') ||
+             lp.startsWith('dist/') || lp.includes('/dist/') ||
+             lp.startsWith('build/') || lp.includes('/build/');
+    };
+
     const walk = (dir: string) => {
       const entries = readdirSync(dir);
       for (const entry of entries) {
         const full = path.join(dir, entry);
         const st = statSync(full);
         if (st.isDirectory()) {
+          const relDir = path.relative(vaultRoot, full).replace(/\\/g, '/');
+          if (shouldExclude(relDir + '/')) continue;
           walk(full);
         } else if (st.isFile() && entry.toLowerCase().endsWith('.md')) {
           const rel = path.relative(vaultRoot, full).replace(/\\/g, '/');
+          if (shouldExclude(rel)) continue;
           const content = readFileSync(full, 'utf-8');
           collected.push({
             path: rel,
@@ -359,17 +437,19 @@ class ObsidianMCPServer {
   private initializeFuse(): void {
     const fuseOptions = {
       keys: [
-        { name: 'title', weight: 0.5 },           // 🎯 Заголовок еще важнее (было 0.4)
-        { name: 'path', weight: 0.2 },            // Путь тоже важен
-        { name: 'description', weight: 0.1 },     // 🎯 Описание менее важно (было 0.15)
-        { name: 'content', weight: 0.15 },        // 🎯 Содержимое менее важно (было 0.2)
-        { name: 'tags', weight: 0.05 }            // Теги
+        { name: 'title', weight: 0.5 },           // Заголовок
+        { name: 'content', weight: 0.3 },         // Полный контент
+        { name: 'description', weight: 0.15 },    // Описание
+        { name: 'path', weight: 0.05 },           // Путь
+        { name: 'tags', weight: 0.05 },           // Теги
+        { name: 'aliases', weight: 0.2 },         // Алиасы из фронтматтера
+        { name: 'type', weight: 0.05 }            // Тип ноды
       ],
-      threshold: 0.25,       // 🎯 ФИНАЛ: разумно строгий (найдет релевантное, но не всё подряд)
-      distance: 20,          // 🎯 ФИНАЛ: средняя дистанция для хорошего поиска
-      minMatchCharLength: 3, // 🎯 ФИНАЛ: минимум 3 символа
-      useExtendedSearch: true, // Включаем расширенный синтаксис поиска
-      ignoreLocation: true   // Игнорируем расположение совпадения в тексте
+      threshold: 0.25,
+      distance: 20,
+      minMatchCharLength: 3,
+      useExtendedSearch: true,
+      ignoreLocation: true
     };
 
     this.fuse = new Fuse(this.indexData, fuseOptions);
@@ -681,9 +761,26 @@ class ObsidianMCPServer {
         case 'tags':
           fieldValue = (note.tags || []).join(' ').toLowerCase();
           break;
+        case 'aliases':
+          fieldValue = (note.aliases || []).join(' ').toLowerCase();
+          break;
+        case 'type':
+          fieldValue = (note.type || '').toLowerCase();
+          break;
         case 'content':
           fieldValue = (note.content || note.content_preview || '').toLowerCase();
           break;
+        default:
+          // fm.<key> поддержка
+          if (fieldQuery.field.startsWith('fm.')) {
+            const fmKey = fieldQuery.field.slice(3);
+            try {
+              const { frontmatter } = this.parseFrontmatterAndBody(note.content || '');
+              const raw = frontmatter?.[fmKey];
+              if (Array.isArray(raw)) fieldValue = raw.join(' ').toLowerCase();
+              else if (raw != null) fieldValue = String(raw).toLowerCase();
+            } catch {}
+          }
       }
       
       const found = fieldValue.includes(fieldQuery.value);
@@ -736,9 +833,25 @@ class ObsidianMCPServer {
           case 'tags':
             fieldValue = (note.tags || []).join(' ').toLowerCase();
             break;
+          case 'aliases':
+            fieldValue = (note.aliases || []).join(' ').toLowerCase();
+            break;
+          case 'type':
+            fieldValue = (note.type || '').toLowerCase();
+            break;
           case 'content':
             fieldValue = (note.content || note.content_preview || '').toLowerCase();
             break;
+          default:
+            if (fieldQuery.field.startsWith('fm.')) {
+              const fmKey = fieldQuery.field.slice(3);
+              try {
+                const { frontmatter } = this.parseFrontmatterAndBody(note.content || '');
+                const raw = frontmatter?.[fmKey];
+                if (Array.isArray(raw)) fieldValue = raw.join(' ').toLowerCase();
+                else if (raw != null) fieldValue = String(raw).toLowerCase();
+              } catch {}
+            }
         }
         
         if (!fieldValue.includes(fieldQuery.value)) return false;
@@ -1000,24 +1113,14 @@ class ObsidianMCPServer {
 
     let allResults: any[] = [];
 
-    // 🔧 ИСПРАВЛЕНИЕ: Если есть только расширенные операторы без обычных терминов
+    // 🔧 ИСПРАВЛЕНИЕ: Advanced-only запросы (только field/required/excluded/phrases) — используем весь индекс как кандидаты
     if (hasAdvancedOperators && searchTerms.length === 0) {
-      console.error(`🔧 Using broad search for advanced operator filtering`);
-      // Делаем широкий поиск по всем заметкам, используя любое общее слово
-      const broadSearchTerms = ['readme', 'система', 'gambit', 'документация', 'тз'];
-      for (const broadTerm of broadSearchTerms) {
-        const results = this.fuse.search(broadTerm);
-        allResults.push(...results);
-      }
-      
-      // Если ничего не нашли широким поиском, берем все заметки
-      if (allResults.length === 0) {
-        allResults = this.indexData.map((note, index) => ({
-          item: note,
-          score: 0,
-          refIndex: index
-        }));
-      }
+      console.error(`🔧 Advanced-only query: using full index as candidate set before advanced filtering`);
+      allResults = this.indexData.map((note, index) => ({
+        item: note,
+        score: 0,
+        refIndex: index
+      }));
     } else {
       // Обычная логика поиска
       const expandedQueries = this.expandQueryWithSynonyms(effectiveQuery || query);
@@ -1040,18 +1143,22 @@ class ObsidianMCPServer {
 
     // 🎯 ФИНАЛЬНАЯ ФИЛЬТРАЦИЯ! Сбалансированный порог качества
     const MIN_SCORE_THRESHOLD = 0.35; // 🎯 ФИНАЛ: разумный баланс точности и полноты
-    const highQualityResults = Array.from(uniqueResults.values())
+    const qualitySortedResults = Array.from(uniqueResults.values())
       .filter((result: any) => {
         const score = result.score ?? 0; // 🔧 ИСПРАВЛЕНИЕ: обрабатываем undefined score как 0 (идеальный)
         return score < MIN_SCORE_THRESHOLD;
       })
-      .sort((a: any, b: any) => (a.score ?? 0) - (b.score ?? 0)) // 🔧 ИСПРАВЛЕНИЕ: безопасная сортировка с undefined
-      .slice(0, limit);
+      .sort((a: any, b: any) => (a.score ?? 0) - (b.score ?? 0)); // 🔧 ИСПРАВЛЕНИЕ: безопасная сортировка с undefined
     
-    console.error(`🎯 Quality filter: ${highQualityResults.length}/${uniqueResults.size} results passed (threshold: ${MIN_SCORE_THRESHOLD})`);
+    console.error(`🎯 Quality filter: ${qualitySortedResults.length}/${uniqueResults.size} results passed (threshold: ${MIN_SCORE_THRESHOLD})`);
 
     // Конвертируем в формат SearchResult
-    const searchResults: SearchResult[] = highQualityResults
+    // Для advanced-only запросов не ограничиваем до лимита до применения фильтров по полям
+    const preLimitResults = (hasAdvancedOperators && searchTerms.length === 0)
+      ? qualitySortedResults
+      : qualitySortedResults.slice(0, limit);
+
+    const searchResults: SearchResult[] = preLimitResults
       .map((result: any) => {
         const note = result.item as ObsidianNote;
         const score = result.score ?? 0; // 🔧 ИСПРАВЛЕНИЕ: безопасная обработка undefined score
@@ -1089,6 +1196,11 @@ class ObsidianMCPServer {
     if (hasAdvancedOperators) {
       filteredResults = this.filterByAdvancedQuery(searchResults, parsedQuery, this.indexData);
       console.error(`🔍 Advanced filtering: ${filteredResults.length}/${searchResults.length} results passed`);
+    }
+
+    // Теперь применяем лимит ТОЛЬКО после advanced-фильтрации для advanced-only запросов
+    if (hasAdvancedOperators && searchTerms.length === 0) {
+      filteredResults = filteredResults.slice(0, limit);
     }
     
     // 🔗 Добавляем связанные заметки к результатам!
@@ -1465,6 +1577,138 @@ class ObsidianMCPServer {
     return { absolutePath, relativePath: relWithExt };
   }
 
+  // Находит заметки без базовой категоризации/фронтматтера
+  public findUncategorizedNotes(options?: { limit?: number }): Array<{ path: string; title: string; reasons: string[] }> {
+    const limit = options?.limit ?? 20;
+    const results: Array<{ path: string; title: string; reasons: string[]; lastModified?: string }> = [];
+    for (const n of this.indexData) {
+      if (n.path.startsWith('.obsidian/') || n.path.includes('/node_modules/')) continue;
+      const content = n.content || n.content_preview || '';
+      const { frontmatter } = this.parseFrontmatterAndBody(content);
+      const fm = frontmatter || {};
+      const reasons: string[] = [];
+      const title = (fm.title || n.title || (n.path.split('/').pop() || '').replace(/\.md$/i, '')) as string;
+      const inCanon = n.path.startsWith('graph/Knowledge Hub/');
+
+      // Базовые проблемы
+      if (!fm || Object.keys(fm).length === 0) reasons.push('no-frontmatter');
+      if (!fm.title) reasons.push('no-title');
+      if (!fm.type) reasons.push('no-type');
+
+      // Для листьев (type != class) ожидаем связь/Relations (taxonomy НЕ обязательна)
+      const isClass = String(fm.type || '').toLowerCase() === 'class';
+      if (!isClass) {
+        const hasFmLink = Array.isArray(fm.part_of) ? fm.part_of.length > 0 : Boolean(fm.part_of);
+        const hasBodyLink = /(^|\n)##\s+Relations\b[\s\S]*?\[\[.+?\]\]/i.test(content);
+        if (!hasFmLink && !hasBodyLink) reasons.push('no-relations');
+      }
+
+      // Вне канон-папок — сигнал к миграции
+      if (!inCanon) reasons.push('outside-canonical-folders');
+
+      // Итог: считаем некатегоризованной, если есть серьёзные причины
+      const serious = reasons.filter(r => ['no-frontmatter','no-type','no-title','outside-canonical-folders','no-relations'].includes(r));
+      if (serious.length > 0) {
+        // Классы считаем ок, если в каноне и есть title/type
+        if (!(isClass && inCanon && !serious.some(r => r !== 'outside-canonical-folders'))) {
+          results.push({ path: n.path, title, reasons: serious, lastModified: n.lastModified });
+        }
+      }
+    }
+    // Сортируем: сначала самые новые
+    results.sort((a, b) => (new Date(b.lastModified || 0).getTime() - new Date(a.lastModified || 0).getTime()));
+    return results.slice(0, limit).map(({ path, title, reasons }) => ({ path, title, reasons }));
+  }
+
+  // Грубая эвристика для определения типа ноды по содержимому
+  private guessTypeByHeuristics(title: string, content: string): string {
+    const t = `${title}\n${content}`.toLowerCase();
+    if (/(обсидиан|templater|dataview|плагин|plugin)/i.test(t)) return 'tool';
+    if (/(психоактив|лекарств|фармаколог|антидепресс|этанол|этиловый спирт|alcohol|ethanol)/i.test(t)) return 'drug';
+    if (/(linux|bash|docker|git|http|api|node|typescript|python|regex)/i.test(t)) return 'technology';
+    return 'note';
+  }
+
+  // Нормализация фронтматтера: baseline + заголовок + тип + теги
+  public normalizeNoteBaseline(options: { filePath: string; dryRun?: boolean }): {
+    path: string;
+    updatedKeys: string[];
+    guessed: { title?: string; type?: string; aliases?: string[]; tags?: string[]; taxonomy?: string[] };
+  } {
+    const { filePath, dryRun = false } = options;
+    const vaultRoot = path.resolve(this.vaultPath);
+    let relWithExt = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
+    // Попытка прямого доступа
+    let abs = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+    if (!abs.startsWith(vaultRoot)) throw new Error('Path escape detected');
+    // Если нет на диске — пробуем найти по индексу (учитываем кавычки/регистр)
+    if (!existsSync(abs)) {
+      const base = path.basename(relWithExt).toLowerCase();
+      // Точный путь в индексе
+      const byExact = this.indexData.find(n => (n.path || '').toLowerCase() === relWithExt.toLowerCase());
+      // По basename
+      const byBase = byExact || this.indexData.find(n => path.basename(n.path || '').toLowerCase() === base);
+      // По title
+      const titleNoExt = base.replace(/\.md$/i, '');
+      const byTitle = byBase || this.indexData.find(n => (n.title || '').toLowerCase() === titleNoExt);
+      if (byTitle) {
+        relWithExt = byTitle.path;
+        abs = path.resolve(vaultRoot, relWithExt.replace(/^\/+/, ''));
+      }
+    }
+    if (!existsSync(abs)) throw new Error(`File not found: ${relWithExt}`);
+    const original = readFileSync(abs, 'utf-8');
+    const { frontmatter, body } = this.parseFrontmatterAndBody(original);
+    const currentFm = frontmatter || {} as Record<string, any>;
+
+    // Заголовок: из FM, из первого H1, иначе из имени файла
+    let title = currentFm.title;
+    if (!title) {
+      const m = body.match(/^#\s+(.+)$/m);
+      title = m ? m[1].trim() : path.basename(relWithExt, '.md');
+    }
+    // Тип
+    let type = currentFm.type;
+    if (!type) type = this.guessTypeByHeuristics(title as string, body);
+    // Теги
+    let tags: string[] = Array.isArray(currentFm.tags) ? currentFm.tags.slice() : (currentFm.tags ? [String(currentFm.tags)] : []);
+    if (!tags.includes('autocaptured')) tags.push('autocaptured');
+    // Алиасы
+    let aliases: string[] = Array.isArray(currentFm.aliases) ? currentFm.aliases.slice() : (currentFm.aliases ? [String(currentFm.aliases)] : []);
+    // Таксономия (не навязываем, оставляем пустой массив, чтобы связать позже)
+    let taxonomy: string[] = Array.isArray(currentFm.taxonomy) ? currentFm.taxonomy.slice() : [];
+
+    const baseline = {
+      source: currentFm.source ?? 'ai',
+      created_by: currentFm.created_by ?? 'ai',
+      status: currentFm.status ?? 'draft',
+      confidence: currentFm.confidence ?? 'medium'
+    };
+
+    const updated: Record<string, any> = {
+      ...currentFm,
+      ...baseline,
+      title,
+      type,
+      tags,
+      aliases,
+      taxonomy
+    };
+
+    const updatedKeys = Object.keys(updated).filter(k => currentFm[k] !== updated[k]);
+    if (!dryRun) {
+      const newContent = this.buildMarkdownWithFrontmatter(updated, body.trimStart());
+      writeFileSync(abs, newContent, { encoding: 'utf-8' });
+      try { this.indexSingleFile(relWithExt); } catch {}
+    }
+
+    return {
+      path: relWithExt,
+      updatedKeys,
+      guessed: { title, type, aliases, tags, taxonomy }
+    };
+  }
+
   public unlinkNotes(options: {
     fromPath: string;
     toPath: string;
@@ -1653,6 +1897,203 @@ class ObsidianMCPServer {
   public getIndexData(): ObsidianNote[] { return this.indexData; }
   public getVaultRoot(): string { return this.vaultPath; }
   public reindexFileIncremental(relPath: string): void { this.indexSingleFile(relPath); }
+
+  // ===== Graph repair and utilities =====
+  private getCanonicalHubPath(): string {
+    return 'graph/Knowledge Hub/Knowledge Hub.md';
+  }
+
+  private ensurePartOf(fromPath: string, toPath: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const fromRel = fromPath.toLowerCase().endsWith('.md') ? fromPath : `${fromPath}.md`;
+    const fromAbs = path.resolve(vaultRoot, fromRel.replace(/^\/+/, ''));
+    if (!existsSync(fromAbs)) return; // avoid resurrecting deleted files
+    const toWikilink = this.toWikiLink(toPath);
+    // frontmatter
+    this.upsertLinkInFrontmatter(fromPath, 'part_of', toWikilink);
+    // body
+    this.appendRelationBody(fromPath, 'Relations', toWikilink);
+  }
+
+  private removeRelatedToHubIfNotHub(filePath: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const rel = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
+    const abs = path.resolve(vaultRoot, rel.replace(/^\/+/, ''));
+    if (!existsSync(abs)) return; // do not touch non-existing
+    const hub = this.getCanonicalHubPath().replace(/\.md$/i, '');
+    const hubWiki = this.toWikiLink(hub);
+    if (rel === this.getCanonicalHubPath()) return;
+    // remove from frontmatter related
+    this.removeLinkFromFrontmatter(rel, 'related', hubWiki);
+    // remove from body under Relations
+    this.removeRelationInBody(rel, 'Relations', hubWiki);
+  }
+
+  private parentIndexPathOf(notePath: string): string | null {
+    // notePath expected with .md, under graph/Knowledge Hub/...
+    const parts = notePath.replace(/\\/g, '/').split('/');
+    if (parts.length < 3) return null;
+    // remove filename
+    parts.pop();
+    if (parts.length === 0) return null;
+    const currentFolder = parts[parts.length - 1];
+    // parent folder
+    if (parts.length < 2) return null;
+    const parentFolder = parts[parts.length - 2];
+    const parentPath = [...parts.slice(0, parts.length - 1), `${parentFolder}.md`].join('/');
+    return parentPath;
+  }
+
+  private ensureIndexNoteExists(indexPath: string): void {
+    const vaultRoot = path.resolve(this.vaultPath);
+    const abs = path.resolve(vaultRoot, indexPath);
+    const dir = path.dirname(abs);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (!existsSync(abs)) {
+      const title = path.basename(indexPath, '.md');
+      const content = `## Summary\nИндекс‑заметка раздела «${title}».\n\n## Relations\n`;
+      const fm = { title, type: 'class' } as Record<string, any>;
+      const md = this.buildMarkdownWithFrontmatter(fm, content);
+      writeFileSync(abs, md, { encoding: 'utf-8' });
+      try { this.indexSingleFile(indexPath); } catch {}
+    }
+  }
+
+  public repairGraph(): { fixed: number } {
+    let fixed = 0;
+    const hub = this.getCanonicalHubPath();
+    const vaultRoot = path.resolve(this.vaultPath);
+    const notes = this.indexData.map(n => n.path).filter(p => p.startsWith('graph/Knowledge Hub/') && p.endsWith('.md'));
+    for (const p of notes) {
+      if (p === hub) continue;
+      const abs = path.resolve(vaultRoot, p);
+      if (!existsSync(abs)) continue; // skip phantom paths
+      // Remove direct related to hub for non-hub
+      this.removeRelatedToHubIfNotHub(p);
+
+      // Ensure chain upwards via folder hierarchy
+      let current = p;
+      while (true) {
+        const parent = this.parentIndexPathOf(current);
+        if (!parent) break;
+        // Ensure parent index note exists
+        this.ensureIndexNoteExists(parent);
+        // Ensure part_of link current -> parent
+        this.ensurePartOf(current, parent);
+        fixed++;
+        if (parent === hub) break;
+        current = parent;
+      }
+    }
+    return { fixed };
+  }
+
+  // ===== Simple template engine =====
+  public applyTemplate(options: { template: string; variables?: Record<string, any>; filePath?: string; writeMode?: 'create'|'overwrite'|'append'; heading?: string }): { content: string; writtenPath?: string } {
+    const { template, variables = {}, filePath, writeMode = 'create', heading } = options;
+    const rendered = template.replace(/{{\s*([a-zA-Z0-9_\.]+)\s*}}/g, (_m, key) => {
+      if (key === 'date') return new Date().toISOString().slice(0, 10);
+      if (key === 'datetime') return new Date().toISOString();
+      const parts = String(key).split('.');
+      let val: any = variables as any;
+      for (const part of parts) { if (val && Object.prototype.hasOwnProperty.call(val, part)) val = val[part]; else { val = ''; break; } }
+      return String(val ?? '');
+    });
+    if (filePath) {
+      const res = this.writeNote({ filePath, content: rendered, writeMode, heading });
+      return { content: rendered, writtenPath: res.relativePath };
+    }
+    return { content: rendered };
+  }
+
+  // ===== Bulk autolink =====
+  public bulkAutolink(options: { mappings: { term: string; toPath: string }[]; maxPerFile?: number; limitFiles?: number }): { updatedFiles: number } {
+    const { mappings, maxPerFile = 3, limitFiles = 50 } = options;
+    let updatedFiles = 0;
+    const vaultRoot = path.resolve(this.vaultPath);
+    const processed = new Set<string>();
+    for (const n of this.indexData) {
+      if (processed.size >= limitFiles) break;
+      if (!n.path.endsWith('.md')) continue;
+      if (n.path.startsWith('.obsidian/') || n.path.includes('/node_modules/')) continue;
+      const abs = path.resolve(vaultRoot, n.path);
+      if (!existsSync(abs)) continue;
+      let text = readFileSync(abs, 'utf-8');
+      let hits = 0;
+      for (const { term, toPath } of mappings) {
+        const noteName = path.basename((toPath.toLowerCase().endsWith('.md')? toPath : `${toPath}.md`), '.md');
+        const re = new RegExp(`(?<!\\[\\[])(${this.escapeRegex(term)})`, 'gi');
+        const before = text;
+        text = text.replace(re, (m) => {
+          if (hits >= maxPerFile) return m;
+          hits++;
+          return `[[${noteName}]]`;
+        });
+        if (text !== before && hits >= maxPerFile) break;
+      }
+      if (hits > 0) {
+        writeFileSync(abs, text, { encoding: 'utf-8' });
+        try { this.indexSingleFile(n.path); } catch {}
+        updatedFiles++;
+        processed.add(n.path);
+      }
+    }
+    return { updatedFiles };
+  }
+
+  // ===== Note move/clone =====
+  public moveNote(options: { fromPath: string; toPath: string; overwrite?: boolean }): { from: string; to: string } {
+    const { fromPath, toPath, overwrite = false } = options;
+    const vaultRoot = path.resolve(this.vaultPath);
+    const fromRel = fromPath.toLowerCase().endsWith('.md') ? fromPath : `${fromPath}.md`;
+    const toRel = toPath.toLowerCase().endsWith('.md') ? toPath : `${toPath}.md`;
+    const fromAbs = path.resolve(vaultRoot, fromRel);
+    const toAbs = path.resolve(vaultRoot, toRel);
+    const toDir = path.dirname(toAbs);
+    if (!existsSync(fromAbs)) throw new Error(`Source not found: ${fromRel}`);
+    if (existsSync(toAbs) && !overwrite) throw new Error(`Target exists: ${toRel}`);
+    if (!existsSync(toDir)) mkdirSync(toDir, { recursive: true });
+    const data = readFileSync(fromAbs, 'utf-8');
+    writeFileSync(toAbs, data, { encoding: 'utf-8' });
+    // remove original
+    rmSync(fromAbs);
+    try { this.indexSingleFile(toRel); } catch {}
+    return { from: fromRel, to: toRel };
+  }
+
+  public cloneNote(options: { fromPath: string; toPath: string; setTitle?: string }): { from: string; to: string } {
+    const { fromPath, toPath, setTitle } = options;
+    const vaultRoot = path.resolve(this.vaultPath);
+    const fromRel = fromPath.toLowerCase().endsWith('.md') ? fromPath : `${fromPath}.md`;
+    const toRel = toPath.toLowerCase().endsWith('.md') ? toPath : `${toPath}.md`;
+    const fromAbs = path.resolve(vaultRoot, fromRel);
+    const toAbs = path.resolve(vaultRoot, toRel);
+    const toDir = path.dirname(toAbs);
+    if (!existsSync(fromAbs)) throw new Error(`Source not found: ${fromRel}`);
+    if (!existsSync(toDir)) mkdirSync(toDir, { recursive: true });
+    let data = readFileSync(fromAbs, 'utf-8');
+    if (setTitle) {
+      const parsed = this.parseFrontmatterAndBody(data);
+      parsed.frontmatter.title = setTitle;
+      data = this.buildMarkdownWithFrontmatter(parsed.frontmatter, parsed.body);
+    }
+    writeFileSync(toAbs, data, { encoding: 'utf-8' });
+    try { this.indexSingleFile(toRel); } catch {}
+    return { from: fromRel, to: toRel };
+  }
+
+  // ===== Note delete =====
+  public deleteNote(options: { path: string }): { deletedPath: string } {
+    const { path: relInput } = options;
+    const vaultRoot = path.resolve(this.vaultPath);
+    const rel = relInput.toLowerCase().endsWith('.md') ? relInput : `${relInput}.md`;
+    const abs = path.resolve(vaultRoot, rel.replace(/^\/+/, ''));
+    if (!abs.startsWith(vaultRoot)) throw new Error('Path escape detected');
+    if (existsSync(abs)) {
+      rmSync(abs);
+    }
+    return { deletedPath: rel };
+  }
 }
 
 // Создаем и экспортируем функцию для создания MCP сервера
@@ -1725,6 +2166,26 @@ export function createServer() {
               }
             },
             required: ["libraryName"]
+          }
+        },
+        {
+          name: "find-uncategorized-notes",
+          description: `🧹 Найти заметки без базовой категоризации (нет фронтматтера/title/type/taxonomy/relations или вне канон-папок).`,
+          inputSchema: {
+            type: "object",
+            properties: { limit: { type: "number", description: "Максимум результатов", default: 20 } }
+          }
+        },
+        {
+          name: "normalize-note-baseline",
+          description: `🧰 Привести заметку к базовому шаблону (frontmatter: title/type/tags/aliases/taxonomy). Не создаёт связи.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              filePath: { type: "string", description: "Путь к заметке" },
+              dryRun: { type: "boolean", description: "Только показать, что будет изменено", default: false }
+            },
+            required: ["filePath"]
           }
         },
         {
@@ -1918,6 +2379,65 @@ Frontmatter: можно передать объект ключ-значение 
           }
         },
         {
+          name: "repair-graph",
+          description: `🧹 Привести граф в порядок по правилу «ёлки».
+
+Действия:
+- Удаляет прямые связи листьев с Knowledge Hub
+- Гарантирует цепочки part_of по иерархии папок (child → parent)
+- Автосоздаёт индекс‑заметки классов при отсутствии
+Возвращает количество исправленных связей/узлов.`,
+          inputSchema: { type: "object", properties: {}, additionalProperties: false }
+        },
+        {
+          name: "apply-template",
+          description: `🧩 Применить простой шаблон {{var}} к содержимому и (опционально) записать в файл.
+
+Переменные: передаются объектом variables; доступны {{date}} и {{datetime}}.
+Если передан filePath — результат будет записан указанным режимом.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              template: { type: "string", description: "Текст шаблона с плейсхолдерами {{var}}" },
+              variables: { type: "object", description: "Объект переменных" },
+              filePath: { type: "string", description: "Куда записать результат (опционально)" },
+              writeMode: { type: "string", enum: ["create","overwrite","append"] },
+              heading: { type: "string", description: "Заголовок для append" }
+            },
+            required: ["template"]
+          }
+        },
+        {
+          name: "bulk-autolink",
+          description: `🔗 Массовая автолинковка: заменить в тексте упоминания на [[Note]].
+
+Параметры: mappings[{term,toPath}], maxPerFile, limitFiles.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              mappings: { type: "array", items: { type: "object", properties: { term: { type: "string" }, toPath: { type: "string" } }, required: ["term","toPath"] } },
+              maxPerFile: { type: "number", default: 3 },
+              limitFiles: { type: "number", default: 50 }
+            },
+            required: ["mappings"]
+          }
+        },
+        {
+          name: "note-move",
+          description: `📦 Переместить заметку в новое место (с созданием папок).`,
+          inputSchema: { type: "object", properties: { fromPath: { type: "string" }, toPath: { type: "string" }, overwrite: { type: "boolean" } }, required: ["fromPath","toPath"] }
+        },
+        {
+          name: "note-clone",
+          description: `📄 Клонировать заметку в новый путь (опц. сменить title).`,
+          inputSchema: { type: "object", properties: { fromPath: { type: "string" }, toPath: { type: "string" }, setTitle: { type: "string" } }, required: ["fromPath","toPath"] }
+        },
+        {
+          name: "note-delete",
+          description: `🗑️ Удалить заметку по пути (осторожно, безвозвратно).`,
+          inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+        },
+        {
           name: "reindex-vault",
           description: `🔄 Проиндексировать все заметки во vault и обновить поисковый индекс (Fuse.js).
 
@@ -1974,9 +2494,21 @@ Frontmatter: можно передать объект ключ-значение 
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (request.params.name === "search-notes") {
-      const query = request.params.arguments?.libraryName as string;
+      let query = request.params.arguments?.libraryName as string;
       if (!query) {
         throw new Error("Missing required parameter: libraryName");
+      }
+
+      // Поддержка пресетов: если строка начинается с preset:, заменяем на шаблон
+      if (query.startsWith('preset:')) {
+        const key = query.slice('preset:'.length);
+        const preset = serverInstance!.getQueryPresets()[key];
+        if (preset) {
+          console.error(`🎛️ Using preset "${key}": ${preset}`);
+          query = preset;
+        } else {
+          console.error(`❌ Preset not found: ${key}`);
+        }
       }
 
       const results = serverInstance!.searchNotes(query);
@@ -2022,6 +2554,27 @@ Try:
             text: formattedContent
           }
         ]
+      };
+    }
+
+    if (request.params.name === "find-uncategorized-notes") {
+      const args = request.params.arguments || {} as any;
+      const limit = Number(args.limit) || 20;
+      const items = serverInstance!.findUncategorizedNotes({ limit });
+      const formatted = items.map((i, idx) => `${idx + 1}. ${i.title} — \`${i.path}\` \n   reasons: ${i.reasons.join(', ')}`).join('\n');
+      return {
+        content: [{ type: 'text', text: (items.length ? `🧹 Found ${items.length} uncategorized notes:\n\n${formatted}` : '✅ No uncategorized notes found.') }]
+      };
+    }
+
+    if (request.params.name === "normalize-note-baseline") {
+      const args = request.params.arguments || {} as any;
+      const filePath = String(args.filePath || '');
+      const dryRun = Boolean(args.dryRun);
+      if (!filePath) throw new Error('filePath is required');
+      const res = serverInstance!.normalizeNoteBaseline({ filePath, dryRun });
+      return {
+        content: [{ type: 'text', text: `🧰 Normalized: \`${res.path}\`\nUpdated keys: ${res.updatedKeys.join(', ') || 'none'}\nGuess: ${JSON.stringify(res.guessed, null, 2)}` }]
       };
     }
 
@@ -2248,6 +2801,48 @@ ${content}`
           { type: "text", text: `🔄 Reindexed notes: ${res.notes}` }
         ]
       };
+    }
+
+    if (request.params.name === "repair-graph") {
+      const res = serverInstance!.repairGraph();
+      return { content: [{ type: 'text', text: `🧹 Graph repaired: ${res.fixed} relations ensured/cleaned` }] };
+    }
+
+    if (request.params.name === "apply-template") {
+      const args = request.params.arguments || {} as any;
+      const rendered = serverInstance!.applyTemplate({
+        template: args.template,
+        variables: args.variables,
+        filePath: args.filePath,
+        writeMode: args.writeMode,
+        heading: args.heading
+      });
+      const pathInfo = rendered.writtenPath ? `\nWritten to: ${rendered.writtenPath}` : '';
+      return { content: [{ type: 'text', text: `✅ Template applied${pathInfo}\n\n${rendered.content}` }] };
+    }
+
+    if (request.params.name === "bulk-autolink") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.bulkAutolink({ mappings: args.mappings || [], maxPerFile: args.maxPerFile, limitFiles: args.limitFiles });
+      return { content: [{ type: 'text', text: `🔗 Bulk autolink updated files: ${res.updatedFiles}` }] };
+    }
+
+    if (request.params.name === "note-move") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.moveNote({ fromPath: args.fromPath, toPath: args.toPath, overwrite: args.overwrite });
+      return { content: [{ type: 'text', text: `📦 Moved: ${res.from} → ${res.to}` }] };
+    }
+
+    if (request.params.name === "note-clone") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.cloneNote({ fromPath: args.fromPath, toPath: args.toPath, setTitle: args.setTitle });
+      return { content: [{ type: 'text', text: `📄 Cloned: ${res.from} → ${res.to}` }] };
+    }
+
+    if (request.params.name === "note-delete") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.deleteNote({ path: args.path });
+      return { content: [{ type: 'text', text: `🗑️ Deleted: ${res.deletedPath}` }] };
     }
 
     if (request.params.name === "get-graph-summary") {

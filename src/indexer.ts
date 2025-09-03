@@ -96,9 +96,21 @@ export class Indexer {
         const files = this.plugin.app.vault.getMarkdownFiles();
         const excludedFolders = this.plugin.settings.excluded_folders;
 
-        const filesToProcess = files.filter(file =>
-            !excludedFolders.some(folder => file.path.startsWith(folder))
-        );
+        const defaultExcludes = [
+            '.obsidian/',
+            'node_modules/',
+            '.venv/',
+            'venv/',
+            'dist/',
+            'build/'
+        ];
+
+        const filesToProcess = files.filter(file => {
+            const p = file.path;
+            if (defaultExcludes.some(pref => p.startsWith(pref) || p.includes('/' + pref))) return false;
+            if (excludedFolders.some(folder => p.startsWith(folder))) return false;
+            return true;
+        });
 
         const fileContents = await Promise.all(
             filesToProcess.map(async (file) => ({
