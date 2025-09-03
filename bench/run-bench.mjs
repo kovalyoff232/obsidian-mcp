@@ -9,6 +9,7 @@ const __dirname = dirname(__filename);
 const ROOT = join(__dirname, '..');
 
 const DEFAULT_DATASET = join(__dirname, 'dataset.json');
+const CONFIG_PATH = join(__dirname, 'config.json');
 
 function now() { return performance.now ? performance.now() : Date.now(); }
 
@@ -67,6 +68,10 @@ async function main() {
   const datasetPath = process.env.MCP_BENCH_DATASET || DEFAULT_DATASET;
   const raw = await readFile(datasetPath, 'utf-8');
   const cases = JSON.parse(raw);
+  let cfg = { enforce: false };
+  try { cfg = JSON.parse(await readFile(CONFIG_PATH, 'utf-8')); } catch {}
+  const envEnforce = (process.env.MCP_BENCH_ENFORCE === 'true' || process.env.BENCH_ENFORCE === 'true');
+  if (envEnforce) cfg.enforce = true;
 
   const server = await startServer();
   const results = [];
@@ -110,7 +115,21 @@ async function main() {
     latency: { p50: p50(latencies), p95: p95(latencies) }
   };
 
-  console.log(JSON.stringify({ summary, results }, null, 2));
+  const report = { summary, results };
+  console.log(JSON.stringify(report, null, 2));
+
+  if (cfg.enforce) {
+    const errs = [];
+    if ((summary.count||0) < (cfg.min_cases||1)) errs.push(`min_cases failed: ${summary.count} < ${cfg.min_cases}`);
+    if (summary.precision_at_10 < (cfg.precision_at_10_min ?? 0)) errs.push(`precision_at_10 ${summary.precision_at_10} < ${cfg.precision_at_10_min}`);
+    if (summary.recall_at_10 < (cfg.recall_at_10_min ?? 0)) errs.push(`recall_at_10 ${summary.recall_at_10} < ${cfg.recall_at_10_min}`);
+    if (summary.mrr_at_10 < (cfg.mrr_at_10_min ?? 0)) errs.push(`mrr_at_10 ${summary.mrr_at_10} < ${cfg.mrr_at_10_min}`);
+    if ((summary.latency?.p95 || 0) > (cfg.latency_ms_p95_max ?? 2000)) errs.push(`latency.p95 ${summary.latency.p95} > ${cfg.latency_ms_p95_max}`);
+    if (errs.length) {
+      console.error('Benchmark thresholds failed:\n' + errs.join('\n'));
+      process.exit(2);
+    }
+  }
 }
 
 main().catch((e)=>{ console.error(e); process.exit(1); });

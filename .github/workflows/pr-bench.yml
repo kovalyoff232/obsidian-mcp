@@ -1,0 +1,35 @@
+name: PR Bench Report
+
+on:
+  pull_request:
+    branches: [ "*" ]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run bench (report-only)
+        run: |
+          npm run bench | tee bench-report.json
+          echo "Bench report saved to bench-report.json"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: bench-report.json
+
