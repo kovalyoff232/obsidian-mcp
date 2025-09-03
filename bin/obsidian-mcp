@@ -10,3 +10,13 @@ const serverPath = join(__dirname, '..', 'dist', 'mcp_server.js');
 
 // Import and run the server
 import(serverPath);
+
+// Print checksum helper if invoked with --checksum
+if (process.argv.includes('--checksum')) {
+  const { createHash } = await import('crypto');
+  const { readFile } = await import('fs/promises');
+  const buf = await readFile(serverPath);
+  const sha256 = createHash('sha256').update(buf).digest('hex');
+  console.log(`sha256  ${sha256}  ${serverPath}`);
+  process.exit(0);
+}
