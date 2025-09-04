@@ -38,7 +38,7 @@ Modern Obsidian plugin that indexes your vault and exposes powerful search and k
 - `bench/` — benchmark runner, config and dataset
 - `plugin_architecture.md` — detailed design notes
 
-## Installation
+## Installation (most users)
 
 1) Install dependencies and build
 
@@ -47,11 +47,11 @@ npm ci
 npm run build
 ```
 
-2) Ensure `dist/mcp_server.js` exists (built by the project). If you prefer release artifacts:
+2) Ensure `dist/mcp_server.js` exists (built by the project).
 
-```bash
-bin/install-server.sh  # or bin/install-server.sh vX.Y.Z
-```
+- You do not need any extra installer. The plugin runs the built server from `dist/`.
+- Advanced: you may pull a prebuilt server from Releases via the optional script (see below).
+
 
 3) Copy/symlink this folder to your Obsidian vault’s plugins dir or load it via a dev vault. Enable the plugin in Obsidian.
 
@@ -112,11 +112,17 @@ npm run bench
   - Produce `artifacts/dist`, `SHA256SUMS.txt`
   - Generate SLSA provenance; optionally Cosign-sign checksums (if secrets provided)
 
-## Installer
+## Advanced: Server updater (optional)
+
+This is not a plugin installer. It only updates `dist/mcp_server.js` in the current plugin folder from GitHub Releases and verifies checksum.
 
 ```bash
+# Help
+bin/install-server.sh --help
+
 # Download and verify server from GitHub Releases
-bin/install-server.sh [vX.Y.Z|latest]
+bin/install-server.sh --tag vX.Y.Z --repo owner/repo   # defaults to your repo if omitted
+bin/install-server.sh                                   # latest
 
 # Verify checksum of local server
 bin/obsidian-mcp --checksum
