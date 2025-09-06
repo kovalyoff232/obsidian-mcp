@@ -111,3 +111,6 @@ WARP.md
 semantic_index.json
 semantic_index.json.bak
 semantic_index.*
+
+# Do not commit npm lockfile
+package-lock.json
