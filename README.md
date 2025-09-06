@@ -1,148 +1,107 @@
-# Obsidian MCP Plugin (Context7-style)
+# Obsidian MCP Plugin — strict tree graph, MCP tools, and fast local search
 
-Modern Obsidian plugin that indexes your vault and exposes powerful search and knowledge-graph tools through the Model Context Protocol (MCP). Designed for local-first workflows with strict folder-first taxonomy.
+Modern Obsidian plugin that indexes your vault and exposes powerful search and graph utilities via the Model Context Protocol (MCP). Local‑first, fast, and now with an enforced “strict tree” policy (ёлка) to keep graphs clean and readable.
+
+## What’s new (strict tree policy)
+
+We enforce a minimal, hierarchical graph by default:
+- Frontmatter: only hierarchical edges via `part_of`. Keys `related`, `depends_on`, `blocks` are rejected.
+- Exactly one parent per note (features → “Фичи”, solutions → “Решения”).
+- Body: at most one wikilink, and it must point to the parent. Headings like “Связи/Relations” are forbidden.
+- Enforcement: `mode: block` (server rejects invalid mutations) for note write/append/frontmatter/link tools.
+
+Policy file (in your vault): `graph/.graph-policy.yml`.
+After editing policy or many notes, run reindex to refresh caches.
 
 ## Key Features
 
 - Vault indexing via Web Worker; writes `index.json` into plugin data folder
-- Integrated MCP server (Node.js) launched by the plugin
-- High-signal search with advanced operators and modes:
+- Embedded MCP server (Node 20) launched by the plugin (stdio transport)
+- High‑signal search with advanced operators and modes:
   - Modes: `balanced`, `taxonomy`, `semantic`
-  - RU/EN normalization (suffix-based stem/lemmatization) and synonyms expansion (user-extendable)
-  - Query expansion, snippet highlighting, and relevance boosting by taxonomy/class
   - Operators: `"exact phrase"`, `+required`, `-excluded`, `title:`, `path:`, `tags:`, `content:`, `aliases:`, `type:`, `fm.<key>`
-  - Presets: configurable complex queries (e.g. `preset:obsidian:plugins`)
-- Obsidian settings for search defaults:
-  - `Search default mode` (`balanced` | `taxonomy` | `semantic`)
-  - `Include linked notes by default`
-  - `Default search limit`
-- Graph tools (MCP): create/link/unlink nodes, repair tree, bulk autolink, etc.
-- Benchmarks (precision@10, recall@10, MRR@10, latency) with PR and Release CI
-- Release supply-chain hardening: checksums, optional Cosign signatures, SLSA provenance
-- Installer helper to fetch and verify MCP server binary
+  - RU/EN normalization + synonyms, highlighting, lightweight expansion
+- Graph tooling (MCP): read/write notes, safe frontmatter updates, normalize, repair tree
+- Bench harness with CI thresholds; release artifacts with checksums and SLSA provenance
 
-## Repository Layout
+## Repository layout
 
-- `src/` — TypeScript sources for the Obsidian plugin
-  - `main.ts` — plugin bootstrap, views, commands
-  - `mcp_server.ts` — child-process manager for the bundled MCP server
-  - `indexer.ts` + `indexer.worker.ts` — vault crawler (worker-based), saves `index.json`
-  - `settings.ts` — UI settings (search defaults, excludes, ports, etc.)
-  - `indexing_view.ts` — UI: logs, progress, control buttons
-  - `types.ts` — `MCPSettings`, `IndexedFile`, defaults
-- `dist/` — bundled JS (`main.js`, `worker.js`, `mcp_server.js`)
-- `bin/` — helpers
-  - `obsidian-mcp` — Node loader for `dist/mcp_server.js` (+ `--checksum`)
-  - `install-server.sh` — downloads release assets and verifies SHA256
-- `.github/workflows/` — `release.yml` and `pr-bench.yml`
-- `bench/` — benchmark runner, config and dataset
-- `plugin_architecture.md` — detailed design notes
+- `src/` — plugin sources
+  - `main.ts` — bootstrap, views, commands
+  - `mcp_server.ts` — spawns `dist/mcp_server.js` (stdio)
+  - `indexer.ts`, `indexer.worker.ts` — vault crawler → `index.json`
+  - `indexing_view.ts`, `settings.ts`, `types.ts`
+- `dist/` — `main.js`, `worker.js`, `mcp_server.js`
+- `bin/` — helpers (`obsidian-mcp --checksum`, `install-server.sh`)
+- `.github/workflows/` — `release.yml`, `pr-bench.yml`
+- `bench/` — runner, config and dataset
 
-## Installation
-
-1) Install dependencies and build
+## Install / build
 
 ```bash
 npm ci
-npm run build
+npm run build        # plugin + worker
+npm run build:mcp    # TypeScript → dist/mcp_server.js
 ```
 
-2) Ensure `dist/mcp_server.js` exists (built by the project).
-
-- You do not need any extra installer. The plugin runs the built server from `dist/`.
-- Advanced: you may pull a prebuilt server from Releases via the optional script (see below).
-
-
-3) Copy/symlink this folder to your Obsidian vault’s plugins dir or load it via a dev vault. Enable the plugin in Obsidian.
+Then enable the plugin in Obsidian. Ensure Node is on PATH (for the server process).
 
 ## Usage
 
 - Open the ribbon action “Activate MCP Indexing View” to see logs and controls
 - Commands:
-  - “Start Indexing” — crawls Markdown files and writes `index.json`
-  - “Restart MCP Server” — restarts the embedded Node MCP server
-- Settings (Settings → Community Plugins → MCP Plugin):
-  - MCP Server Port (currently Node stdio transport is used by the plugin)
-  - Python Path (reserved; not required for current flow)
-  - Embedding Model (reserved; current indexing stores previews only)
-  - Excluded Folders
-  - Search defaults: default mode, include linked, default limit
+  - “Start Indexing” — crawl Markdown and write `index.json`
+  - “Restart MCP Server” — restart embedded server
+- Common scripts:
+  - `npm run dev` — dev watch (plugin + worker)
+  - `npm run start:mcp` — run server (stdio)
+  - `npm run start:mcp-http` — experimental HTTP mode
+  - `npm run bench` — run benchmarks (set `MCP_BENCH_ENFORCE=true` to enforce thresholds)
 
-## MCP Tools (server)
+## MCP server tools (selection)
 
-Server is bundled in `dist/mcp_server.js` and started with stdio transport. Available tools include:
-
-- `search-notes` — semantic/fuzzy/taxonomy-aware search
-  - Args: `libraryName` (query string), `mode` (`balanced|taxonomy|semantic`), `limit` (number), `includeLinked` (boolean)
-- `get-note-content` — fetch full content by id/title/path
-- Graph and maintenance:
-  - `find-uncategorized-notes`, `normalize-note-baseline`
-  - `write-note`, `append-under-heading`, `create-node`
-  - `link-notes`, `unlink-notes`, `upsert-frontmatter`, `repair-graph`
-  - `apply-template`, `bulk-autolink`, `note-move`, `note-clone`, `note-delete`
-  - `reindex-vault`, `reindex-changed-since`, `get-graph-summary`, `find-unlinked-mentions`
+- Search/content: `search-notes`, `get-note-content`
+- Graph/notes: `create-node`, `write-note`, `append-under-heading`, `upsert-frontmatter`,
+  `link-notes`, `unlink-notes`, `note-move`, `note-clone`, `note-delete`
+- Index/maintenance: `reindex-vault`, `reindex-changed-since`, `normalize-note-baseline`,
+  `find-uncategorized-notes`, `get-graph-summary`, `repair-graph`
 
 Notes:
-- RU/EN normalization uses lightweight suffix rules. The code is ready for lazy external stemmers when added.
-- Synonyms: built-in dictionary + user-provided from vault notes (json or `key: a, b, c`).
+- RU/EN normalization is lightweight; synonyms can be extended from your vault.
+- Semantic mode can be enabled gradually; text search remains primary.
 
-## Search Modes
+## Strict tree policy (details)
 
-- `balanced` — general-purpose weights across title/path/content
-- `taxonomy` — boosts folder/class and taxonomy signals
-- `semantic` — normalization-heavy matching with heuristic score adjustment
+- File: `graph/.graph-policy.yml`
+- Mode: `block` — invalid writes are rejected
+- Rules:
+  - Disallow frontmatter keys: `related`, `depends_on`, `blocks`
+  - Require `part_of` with exactly one parent (feature → “Фичи”, solution → “Решения”)
+  - Body wikilinks: `max_total: 1`, `only_to_parent: true`
+  - Banned headings: `Связи`, `Relations`, `Связанное`, `Related`
+- Validated tools: `write-note`, `append-under-heading`, `upsert-frontmatter`, `link-notes`, `unlink-notes`, `note-move`, `note-clone`
+
+Reindex after bulk edits:
+
+```bash
+npm run bench   # optional quality check
+# or via MCP: reindex-vault
+```
 
 ## Benchmarks
 
-Run locally:
-
 ```bash
 npm run bench
+# Enforce thresholds:
+MCP_BENCH_ENFORCE=true npm run bench
 ```
 
-- Config: `bench/config.json` (thresholds); environment `MCP_BENCH_ENFORCE=true` enforces failure on regressions
-- Dataset: `bench/dataset.json` (queries and expected paths)
-- Metrics: `precision_at_10`, `recall_at_10`, `mrr_at_10`, `latency.p50/p95`
+Artifacts: report JSON; metrics include p50/p95 latency, precision/recall@10, MRR@10.
 
 ## CI/CD
 
-- PRs: `.github/workflows/pr-bench.yml` produces a report artifact
-- Releases: `.github/workflows/release.yml`
-  - Build + enforced bench
-  - Produce `artifacts/dist`, `SHA256SUMS.txt`
-  - Generate SLSA provenance; optionally Cosign-sign checksums (if secrets provided)
-
-## Advanced: Server updater (optional)
-
-This is not a plugin installer. It only updates `dist/mcp_server.js` in the current plugin folder from GitHub Releases and verifies checksum.
-
-```bash
-# Help
-bin/install-server.sh --help
-
-# Download and verify server from GitHub Releases
-bin/install-server.sh --tag vX.Y.Z --repo owner/repo   # defaults to your repo if omitted
-bin/install-server.sh                                   # latest
-
-# Verify checksum of local server
-bin/obsidian-mcp --checksum
-```
-
-## Development
-
-- Build: `npm run build` (plugin and worker), `npm run build:mcp` (ensure server permissions)
-- Dev: `npm run dev` (esbuild watch) in another shell
-- Code style: TypeScript, explicit types on public APIs; keep functions small and readable
-
-## Configuration Surface (Settings)
-
-- `mcp_port`: number (currently unused for stdio mode)
-- `python_path`: string (reserved)
-- `embedding_model`: string (reserved)
-- `excluded_folders`: string[]
-- `search_default_mode`: `'balanced' | 'taxonomy' | 'semantic'`
-- `search_include_linked_default`: boolean
-- `search_limit_default`: number
+- PR: `.github/workflows/pr-bench.yml` uploads bench report
+- Release: `.github/workflows/release.yml` builds, enforces bench, publishes artifacts (`dist/`, `SHA256SUMS.txt`), SLSA provenance; optional Cosign signing
 
 ## License
 
