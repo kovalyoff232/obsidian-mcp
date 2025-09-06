@@ -1,6 +1,6 @@
 {
   "name": "@kovalyoff/obsidian-notes-mcp",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "description": "MCP plugin for Obsidian - Context7-style architecture for local notes",
   "main": "main.js",
   "type": "module",
