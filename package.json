@@ -44,6 +44,7 @@
     "@modelcontextprotocol/sdk": "^1.17.2",
     "commander": "^14.0.0",
     "fuse.js": "^7.1.0",
+    "yaml": "^2.8.1",
     "zod": "^3.25.76"
   }
 }

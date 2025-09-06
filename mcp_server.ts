@@ -9,6 +9,7 @@ import {
 import { fileURLToPath } from "url";
 import path from "path";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, statSync, rmSync } from "fs";
+import YAML from 'yaml';
 import Fuse from "fuse.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -168,6 +169,21 @@ interface SearchResult {
   confidence: string;
 }
 
+// Политика графа (жёсткая проверка)
+interface GraphPolicy {
+  mode?: 'warn' | 'block';
+  roots?: string[];
+  links?: { parentKey?: string; otherKeys?: string[]; relationsHeading?: string };
+  types?: Record<string, {
+    required?: string[];
+    mustHaveParent?: boolean;
+    allowMultipleParents?: boolean;
+    allowedParentTypes?: string[];         // тип(ы) допустимых родителей (по frontmatter.type)
+    allowedParentTitles?: string[];        // допустимые заголовки родителей (frontmatter.title)
+    allowedParentPathIncludes?: string[];  // подстроки, которые должен содержать путь родителя
+  }>;
+}
+
 const DEFAULT_LIMIT = 20; // 🎯 Увеличили по просьбе пользователя для больше результатов
 
 // Определяем путь к файлу индекса
@@ -248,6 +264,14 @@ class ObsidianMCPServer {
   private embedModel: string = 'Xenova/all-MiniLM-L6-v2';
   private embedXenovaPipeline: any = null;
   
+  // 🔒 Политика графа (жёсткая валидация)
+  private graphPolicy: GraphPolicy = {};
+  private graphPolicyPath: string = '';
+  private graphPolicyMtime: number = 0;
+  private policyMode: 'warn' | 'block' = 'warn';
+  private parentKey: string = 'part_of';
+  private relationsHeading: string = 'Relations';
+  
   // 📊 АНАЛИТИКА И СТАТИСТИКА
   private searchStats = {
     totalSearches: 0,
@@ -281,6 +305,8 @@ class ObsidianMCPServer {
     } catch {}
     this.categories = this._initCategories();
     this.vaultPath = this.findVaultPath();
+    // Загружаем политику графа (если есть)
+    try { this.loadGraphPolicy(); } catch (e) { console.error('⚠️ graph policy load failed:', e); }
     // Инициализируем внешние стеммеры в фоне (не блокируем запуск)
     this.initStemLibsAsync();
     // Семантический слой: флаг из окружения
@@ -1572,6 +1598,11 @@ class ObsidianMCPServer {
 
     if (writeMode === 'overwrite' || (writeMode === 'create' && !fileExists)) {
       const finalContent = this.buildMarkdownWithFrontmatter(frontmatter, content);
+      // Политика: валидируем фронтматтер перед записью
+      try {
+        const parsed = this.parseFrontmatterAndBody(finalContent);
+        this.enforcePolicy(relWithExt, parsed.frontmatter || {});
+      } catch (e) { if (this.policyMode === 'block') throw e; else console.error('⚠️ policy warn:', e); }
       writeFileSync(absolutePath, finalContent, { encoding: 'utf-8' });
       // 🔄 Инкрементальная индексация
       try { this.scheduleIndexSingleFile(relWithExt); } catch {}
@@ -1629,18 +1660,17 @@ class ObsidianMCPServer {
     if (!frontmatter || Object.keys(frontmatter).length === 0) {
       return content;
     }
-    const yaml = Object.entries(frontmatter)
-      .map(([key, value]) => {
-        if (Array.isArray(value)) {
-          return `${key}: [${value.map(v => JSON.stringify(v)).join(', ')}]`;
-        }
-        if (value && typeof value === 'object') {
-          return `${key}: ${JSON.stringify(value)}`;
-        }
-        return `${key}: ${JSON.stringify(value)}`;
-      })
-      .join('\n');
-    return `---\n${yaml}\n---\n\n${content}`;
+    try {
+      const yamlText = YAML.stringify(frontmatter, { indent: 2, lineWidth: 0 });
+      const fm = yamlText.endsWith('\n') ? yamlText : yamlText + '\n';
+      return `---\n${fm}---\n\n${content}`;
+    } catch (e) {
+      // Fallback: JSON-like dump, to avoid data loss if YAML fails unexpectedly
+      const jsonLike = Object.entries(frontmatter)
+        .map(([key, value]) => `${key}: ${JSON.stringify(value)}`)
+        .join('\n');
+      return `---\n${jsonLike}\n---\n\n${content}`;
+    }
   }
 
   private appendUnderHeading(original: string, heading: string, addition: string): string {
@@ -1660,28 +1690,139 @@ class ObsidianMCPServer {
   }
 
   private parseFrontmatterAndBody(original: string): { frontmatter: Record<string, any>, body: string } {
-    const fmMatch = original.match(/^---\n([\s\S]*?)\n---\n?/);
-    let body = original;
-    const obj: Record<string, any> = {};
-    if (fmMatch) {
-      const fmText = fmMatch[1];
-      body = original.slice(fmMatch[0].length);
-      for (const line of fmText.split('\n')) {
-        const m = line.match(/^([^:]+):\s*(.*)$/);
-        if (m) {
-          const key = m[1].trim();
-          let val: any = m[2].trim();
-          if (val.startsWith('[') || val.startsWith('{')) {
-            try { val = JSON.parse(val); } catch {}
-          } else if (/^".*"$/.test(val) || /^'.*'$/.test(val)) {
-            val = val.slice(1, -1);
+    // Robust YAML-based frontmatter parsing
+    const fmRegex = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
+    const match = original.match(fmRegex);
+    if (!match) {
+      return { frontmatter: {}, body: original };
+    }
+    const fmText = match[1];
+    const body = original.slice(match[0].length);
+    try {
+      const parsed = YAML.parse(fmText) as unknown;
+      const fm = (parsed && typeof parsed === 'object') ? (parsed as Record<string, any>) : {};
+      return { frontmatter: fm, body };
+    } catch {
+      // If YAML parse fails, do not drop the body; return empty FM so callers can choose to skip destructive writes
+      return { frontmatter: {}, body };
+    }
+  }
+
+  // ===== Политика графа: загрузка, проверка, доступ =====
+  private policyDefaults(): GraphPolicy {
+    return {
+      mode: (process.env.MCP_GRAPH_POLICY_MODE === 'block' ? 'block' : 'warn'),
+      links: { parentKey: 'part_of', otherKeys: ['related','depends_on','blocks'], relationsHeading: 'Relations' },
+      types: {
+        hub: { required: ['title','type'] },
+        project: { required: ['title','type','part_of'], mustHaveParent: true },
+        index: { required: ['title','type','part_of'], mustHaveParent: true },
+        feature: { required: ['title','type','part_of','status'], mustHaveParent: true },
+        solution: { required: ['title','type','part_of'], mustHaveParent: true },
+        runbook: { required: ['title','type','part_of'], mustHaveParent: true },
+        benchmark: { required: ['title','type','part_of'], mustHaveParent: true },
+        domain: { required: ['title','type','part_of'], mustHaveParent: true },
+        topic: { required: ['title','type','part_of'], mustHaveParent: true }
+      }
+    };
+  }
+
+  public loadGraphPolicy(): void {
+    const root = path.resolve(this.vaultPath);
+    const candidate = path.join(root, 'graph', '.graph-policy.yml');
+    this.graphPolicyPath = candidate;
+    let policy: GraphPolicy = this.policyDefaults();
+    try {
+      if (existsSync(candidate)) {
+        const txt = readFileSync(candidate, 'utf-8');
+        const obj = YAML.parse(txt) as any;
+        if (obj && typeof obj === 'object') policy = { ...policy, ...obj };
+        try { this.graphPolicyMtime = statSync(candidate).mtimeMs; } catch {}
+      }
+    } catch (e) {
+      console.error('⚠️ Failed to read graph policy, using defaults:', e);
+    }
+    this.graphPolicy = policy;
+    this.policyMode = (policy.mode === 'block' ? 'block' : 'warn');
+    this.parentKey = policy.links?.parentKey || 'part_of';
+    this.relationsHeading = policy.links?.relationsHeading || 'Relations';
+    console.error(`🔒 Graph policy loaded (mode=${this.policyMode}) from ${existsSync(candidate) ? candidate : '[defaults]'}`);
+  }
+
+  private validateNoteAgainstPolicy(filePath: string, fm: Record<string, any>): string[] {
+    const issues: string[] = [];
+    const t = String(fm?.type || '').toLowerCase();
+    const spec = (this.graphPolicy.types || {})[t];
+    if (!spec) return issues; // неизвестные типы не проверяем строго
+
+    // required поля
+    for (const k of (spec.required || [])) {
+      const v = (fm as any)[k];
+      if (v === undefined || v === null || (typeof v === 'string' && v.trim() === '') || (Array.isArray(v) && v.length === 0)) issues.push(`missing-required:${k}`);
+    }
+
+    // Родители
+    const parentVal = (fm as any)[this.parentKey];
+    const parents = Array.isArray(parentVal) ? parentVal : (parentVal ? [parentVal] : []);
+    if (spec.mustHaveParent && parents.length === 0) issues.push('missing-parent');
+    if (!spec.allowMultipleParents && parents.length > 1) issues.push('multiple-parents');
+
+    // Проверка типа/имени родителя (если задано в политике)
+    if (parents.length > 0 && (spec.allowedParentTypes || spec.allowedParentTitles || spec.allowedParentPathIncludes)) {
+      const getParentInfo = (wikilinkOrKey: string): { type?: string; title?: string; path?: string } => {
+        const key = (wikilinkOrKey || '').replace(/^\[\[|\]\]$/g, '').split('#')[0];
+        const p = this.resolveNoteKeyToPath(key) || key;
+        let content = '';
+        const note = this.indexData.find(n => n.path === p);
+        if (note) content = note.content || note.content_preview || '';
+        else {
+          try {
+            const abs = path.resolve(this.vaultPath, p.toLowerCase().endsWith('.md') ? p : `${p}.md`);
+            if (existsSync(abs)) content = readFileSync(abs, 'utf-8');
+          } catch {}
+        }
+        if (!content) return { path: p };
+        const parsed = this.parseFrontmatterAndBody(content);
+        const pt = String(parsed.frontmatter?.type || '').toLowerCase();
+        const tt = String(parsed.frontmatter?.title || '');
+        return { type: pt, title: tt, path: p };
+      };
+
+      for (const par of parents) {
+        const info = getParentInfo(String(par));
+        if (spec.allowedParentTypes && spec.allowedParentTypes.length > 0) {
+          if (!info.type || !spec.allowedParentTypes.includes(info.type)) {
+            issues.push(`invalid-parent-type:${info.type || 'unknown'} expected:${spec.allowedParentTypes.join('|')}`);
           }
-          obj[key] = val;
+        }
+        if (spec.allowedParentTitles && spec.allowedParentTitles.length > 0) {
+          if (!info.title || !spec.allowedParentTitles.includes(info.title)) {
+            issues.push(`invalid-parent-title:${info.title || 'unknown'} expected:${spec.allowedParentTitles.join('|')}`);
+          }
+        }
+        if (spec.allowedParentPathIncludes && spec.allowedParentPathIncludes.length > 0) {
+          const pathOk = info.path && spec.allowedParentPathIncludes.some(s => (info.path as string).includes(s));
+          if (!pathOk) issues.push(`invalid-parent-path:${info.path || 'unknown'} must-include:${spec.allowedParentPathIncludes.join('|')}`);
         }
       }
     }
-    return { frontmatter: obj, body };
+
+    return issues;
   }
+
+  private enforcePolicy(filePath: string, fm: Record<string, any>): void {
+    const issues = this.validateNoteAgainstPolicy(filePath, fm);
+    if (issues.length === 0) return;
+    const msg = `Graph policy violation in ${filePath}:\n- ${issues.join('\n- ')}`;
+    if (this.policyMode === 'block') throw new Error(msg);
+    else console.error('⚠️', msg);
+  }
+
+  public getGraphPolicyPublic(): { mode: string; parentKey: string; relationsHeading: string; path: string; policy: GraphPolicy } {
+    return { mode: this.policyMode, parentKey: this.parentKey, relationsHeading: this.relationsHeading, path: this.graphPolicyPath || 'defaults', policy: this.graphPolicy };
+  }
+  public parseFrontmatterPublic(content: string): { frontmatter: Record<string, any>, body: string } { return this.parseFrontmatterAndBody(content); }
+  public validateAgainstPolicyPublic(path: string, fm: Record<string, any>): string[] { return this.validateNoteAgainstPolicy(path, fm); }
 
   // ПУБЛИЧНЫЙ: создать «нод» — заметку с frontmatter (id, type, props)
   public createNode(options: {
@@ -1762,6 +1903,7 @@ class ObsidianMCPServer {
     obj[relation] = list;
 
     const newContent = this.buildMarkdownWithFrontmatter(obj, body.trimStart());
+    try { this.enforcePolicy(relWithExt, obj); } catch (e) { if (this.policyMode === 'block') throw e; else console.error('⚠️ policy warn:', e); }
     writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
     // 🔄 Инкрементальная индексация
     try { this.scheduleIndexSingleFile(relWithExt); } catch {}
@@ -1828,6 +1970,7 @@ class ObsidianMCPServer {
       for (const k of removeKeys) delete frontmatter[k];
     }
     const newContent = this.buildMarkdownWithFrontmatter(frontmatter, body.trimStart());
+    try { this.enforcePolicy(relWithExt, frontmatter); } catch (e) { if (this.policyMode === 'block') throw e; else console.error('⚠️ policy warn:', e); }
     writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
     // 🔄 Инкрементальная индексация
     try { this.scheduleIndexSingleFile(relWithExt); } catch {}
@@ -3639,6 +3782,21 @@ Frontmatter: можно передать объект ключ-значение 
           }
         },
         {
+          name: "get-graph-policy",
+          description: `📜 Показать текущую политику графа (режимы, типы, ключи).`,
+          inputSchema: { type: "object", properties: {}, additionalProperties: false }
+        },
+        {
+          name: "reload-graph-policy",
+          description: `🔁 Перезагрузить graph/.graph-policy.yml и обновить параметры валидации.`,
+          inputSchema: { type: "object", properties: {}, additionalProperties: false }
+        },
+        {
+          name: "validate-graph",
+          description: `✅ Прогнать валидацию по vault: проверка required/type/parent. Возвращает отчет.`,
+          inputSchema: { type: "object", properties: { pathPrefix: { type: 'string' } }, additionalProperties: false }
+        },
+        {
           name: "bulk-autolink",
           description: `🔗 Массовая автолинковка: заменить в тексте упоминания на [[Note]].
 
@@ -4207,6 +4365,31 @@ ${content}`
       });
       const pathInfo = rendered.writtenPath ? `\nWritten to: ${rendered.writtenPath}` : '';
       return { content: [{ type: 'text', text: `✅ Template applied${pathInfo}\n\n${rendered.content}` }] };
+    }
+
+    if (request.params.name === "get-graph-policy") {
+      const p = serverInstance!.getGraphPolicyPublic();
+      return { content: [{ type: 'text', text: JSON.stringify(p, null, 2) }] };
+    }
+
+    if (request.params.name === "reload-graph-policy") {
+      serverInstance!.loadGraphPolicy();
+      return { content: [{ type: 'text', text: `🔁 Graph policy reloaded (mode=${serverInstance!.getGraphPolicyPublic().mode})` }] };
+    }
+
+    if (request.params.name === "validate-graph") {
+      const args = request.params.arguments || {} as any;
+      const prefix = (args.pathPrefix as string) || '';
+      const items = serverInstance!.getIndexData().filter((n: ObsidianNote) => n.path.endsWith('.md') && (!prefix || n.path.startsWith(prefix)));
+      const results = [] as Array<{ path: string; issues: string[] }>;
+      for (const n of items) {
+        const content = n.content || n.content_preview || '';
+        const parsed = serverInstance!.parseFrontmatterPublic(content);
+        const issues = serverInstance!.validateAgainstPolicyPublic(n.path, parsed.frontmatter || {});
+        if (issues.length) results.push({ path: n.path, issues });
+      }
+      const summary = { total: items.length, invalid: results.length };
+      return { content: [{ type: 'text', text: JSON.stringify({ summary, results }, null, 2) }] };
     }
 
     if (request.params.name === "bulk-autolink") {

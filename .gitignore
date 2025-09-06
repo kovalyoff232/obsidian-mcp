@@ -106,3 +106,8 @@ update_plan.md
 
 # Warp (local guidance file; do not commit)
 WARP.md
+
+# Semantic search artifacts
+semantic_index.json
+semantic_index.json.bak
+semantic_index.*
