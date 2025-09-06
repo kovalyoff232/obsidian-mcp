@@ -85,7 +85,8 @@ async function main() {
     const res = await callTool(server, 'search-notes', { libraryName: q, limit, mode, includeLinked });
     const t1 = now();
     const timeMs = t1 - t0;
-    const blocks = res?.content?.[0]?.text || '';
+    // Fix: JSON-RPC wraps tool response under result.{content:[{text:...}]}
+    const blocks = res?.result?.content?.[0]?.text || '';
     const lines = blocks.split('\n');
     const paths = lines.filter(l => l.trim().startsWith('📁 Path:'))
       .map(l => l.split('`')[1])

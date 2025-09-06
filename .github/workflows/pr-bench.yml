@@ -27,9 +27,28 @@ jobs:
           npm run bench | tee bench-report.json
           echo "Bench report saved to bench-report.json"
 
-      - name: Upload artifact
+      - name: Run graph smoke (report-only)
+        run: |
+          npm run bench:graph | tee bench-graph.json
+          echo "Graph smoke saved to bench-graph.json"
+
+      - name: Run capture smoke (report-only)
+        run: |
+          npm run bench:capture | tee bench-capture.json
+          echo "Capture smoke saved to bench-capture.json"
+
+      - name: Run semantic smoke (report-only)
+        run: |
+          npm run bench:semantic | tee bench-semantic.json
+          echo "Semantic smoke saved to bench-semantic.json"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bench-report
-          path: bench-report.json
+          name: bench-reports
+          path: |
+            bench-report.json
+            bench-graph.json
+            bench-capture.json
+            bench-semantic.json
 

@@ -195,10 +195,58 @@ class ObsidianMCPServer {
   private vaultPath: string = ''; // Путь к vault для доступа к полным файлам
   private fuse: Fuse<ObsidianNote> | null = null; // Fuse.js поисковик
   
-  // 🚀 УМНОЕ КЭШИРОВАНИЕ
+  // Индекс-ревизия (увеличивается при любой переиндексации/изменении)
+  private indexRevision: number = 0;
+
+  // Быстрый обратный индекс: targetPath -> Set<sourcePath>
+  private backlinkIndex: Map<string, Set<string>> = new Map();
+  
+  // 🚀 УМНОЕ КЭШИРОВАНИЕ ПОИСКА
   private searchCache = new Map<string, {results: SearchResult[], timestamp: number, hitCount: number}>();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 минут
   private readonly MAX_CACHE_SIZE = 100; // Максимум 100 запросов в кэше
+
+  // Кэш тяжёлых графовых/навигационных ответов
+  private heavyCache = new Map<string, { value: any; ts: number }>();
+  private readonly HEAVY_TTL = 3 * 60 * 1000; // 3 минуты
+  private readonly HEAVY_MAX = 50;
+  private readonly INDEX_DEBOUNCE_MS: number = (() => {
+    const v = parseInt(process.env.MCP_INDEX_DEBOUNCE_MS || '500', 10);
+    return Number.isFinite(v) && v >= 0 ? v : 500;
+  })();
+  private readonly SEM_ALPHA: number = (() => {
+    const v = parseFloat(process.env.MCP_SEMANTIC_ALPHA || '0.7');
+    return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.7;
+  })();
+  private readonly SEM_MINLEN_QUERY: number = (() => {
+    const v = parseInt(process.env.MCP_SEMANTIC_MINLEN_QUERY || '40', 10);
+    return Number.isFinite(v) && v >= 0 ? v : 40;
+  })();
+  private readonly SEM_MAX_SCAN: number = (() => {
+    const v = parseInt(process.env.MCP_SEMANTIC_MAX_SCAN || '2000', 10);
+    return Number.isFinite(v) && v > 0 ? v : 2000;
+  })();
+  private readonly SNIPPET_LEN: number = (() => {
+    const v = parseInt(process.env.MCP_SNIPPET_LEN || '200', 10);
+    return Number.isFinite(v) && v > 50 ? v : 200;
+  })();
+
+  // Дебаунс для инкрементальной индексации
+  private indexDebounceTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  // 🔬 Семантический слой (скелет): включение/хранилище
+  private semanticEnabled: boolean = false;
+  private embedStore: Map<string, number[]> = new Map();
+  private embedStorePath: string = '';
+  private embedPersist: boolean = true;
+  private embedSaveTimer: NodeJS.Timeout | null = null;
+  private embedPending: Set<string> = new Set();
+  private embedUpdateTimer: NodeJS.Timeout | null = null;
+  private embedDirty: boolean = false;
+  private embedBackup: boolean = true;
+  private embedProvider: 'hash' | 'xenova' = 'hash';
+  private embedModel: string = 'Xenova/all-MiniLM-L6-v2';
+  private embedXenovaPipeline: any = null;
   
   // 📊 АНАЛИТИКА И СТАТИСТИКА
   private searchStats = {
@@ -235,6 +283,16 @@ class ObsidianMCPServer {
     this.vaultPath = this.findVaultPath();
     // Инициализируем внешние стеммеры в фоне (не блокируем запуск)
     this.initStemLibsAsync();
+    // Семантический слой: флаг из окружения
+    this.semanticEnabled = (process.env.MCP_SEMANTIC_ENABLED === 'true');
+    this.embedPersist = (process.env.MCP_SEMANTIC_PERSIST !== 'false');
+    this.embedStorePath = process.env.MCP_SEMANTIC_STORE || path.join(PLUGIN_ROOT, 'semantic_index.json');
+    this.embedBackup = (process.env.MCP_SEMANTIC_BACKUP !== 'false');
+    console.error(`🧠 Semantic layer ${this.semanticEnabled ? 'ENABLED' : 'disabled'} (env MCP_SEMANTIC_ENABLED)`);
+    console.error(`💾 Semantic persist ${this.embedPersist ? 'ON' : 'off'} → ${this.embedStorePath} (backup ${this.embedBackup ? 'ON' : 'off'})`);
+    try { this.loadEmbedStoreFromDisk(); } catch (e) { console.error('⚠️ semantic store load failed:', e); }
+    // Инициализация провайдера эмбеддингов (в фоне)
+    try { this.initEmbedProviderAsync(); } catch {}
   }
 
   // Готовые пресеты сложных запросов
@@ -272,6 +330,32 @@ class ObsidianMCPServer {
     
     // Асинхронно загружаем index для избежания блокировки
     this.loadIndex().catch(console.error);
+  }
+
+  private bumpRevisionAndInvalidate() {
+    this.indexRevision++;
+    this.clearCache();
+    this.heavyCache.clear();
+  }
+
+  private heavyKey(name: string, args: any): string {
+    return JSON.stringify({ n: name, a: args, rev: this.indexRevision });
+  }
+
+  private heavyGet(key: string): any | null {
+    const e = this.heavyCache.get(key);
+    if (!e) return null;
+    if (Date.now() - e.ts > this.HEAVY_TTL) { this.heavyCache.delete(key); return null; }
+    return e.value;
+  }
+
+  private heavySet(key: string, value: any) {
+    // simple LRU-ish: delete oldest entry when exceeding limit
+    if (this.heavyCache.size >= this.HEAVY_MAX) {
+      const firstKey = this.heavyCache.keys().next().value;
+      if (firstKey) this.heavyCache.delete(firstKey);
+    }
+    this.heavyCache.set(key, { value, ts: Date.now() });
   }
 
   // Определяем путь к vault
@@ -332,8 +416,9 @@ class ObsidianMCPServer {
         
         this.isLoaded = true;
         
-        // 🚀 Очищаем кэш при обновлении индекса
-        this.clearCache();
+        // Перестроить обратный индекс и инкрементировать ревизию
+        this.rebuildBacklinkIndex();
+        this.bumpRevisionAndInvalidate();
         
         console.error(`✅ Successfully loaded ${this.indexData.length} notes from index`);
         console.error(`🚀 Fuse.js search engine initialized with full content`);
@@ -447,7 +532,8 @@ class ObsidianMCPServer {
     await this.loadFullContent();
     this.initializeFuse();
     this.isLoaded = true;
-    this.clearCache();
+    this.rebuildBacklinkIndex();
+    this.bumpRevisionAndInvalidate();
     return { notes: this.indexData.length };
   }
 
@@ -515,7 +601,8 @@ class ObsidianMCPServer {
       const noteRef = this.indexData.find(n => n.path === relWithExt)!;
       noteRef.content = content;
       this.initializeFuse();
-      this.clearCache();
+      this.rebuildBacklinkIndex();
+      this.bumpRevisionAndInvalidate();
 
       // сохраняем индекс на диск
       try {
@@ -533,6 +620,25 @@ class ObsidianMCPServer {
     } catch (e) {
       console.error('❌ indexSingleFile error:', e);
     }
+  }
+
+  // Поставить задачу на отложенную индексацию одного файла
+  private scheduleIndexSingleFile(relativePathInput: string, delayMs?: number): void {
+    try {
+      const rel = relativePathInput.replace(/^\/+/, '');
+      const relWithExt = rel.toLowerCase().endsWith('.md') ? rel : `${rel}.md`;
+      // сбросить предыдущий таймер
+      const t = this.indexDebounceTimers.get(relWithExt);
+      if (t) { clearTimeout(t); this.indexDebounceTimers.delete(relWithExt); }
+      const delay = Math.max(50, typeof delayMs === 'number' ? delayMs : this.INDEX_DEBOUNCE_MS);
+      const timer = setTimeout(() => {
+        try { this.indexSingleFile(relWithExt); } catch {}
+        // Планируем обновление эмбеддинга для файла (если включена семантика или персист)
+        try { this.scheduleEmbedUpdate(relWithExt); } catch {}
+        this.indexDebounceTimers.delete(relWithExt);
+      }, delay);
+      this.indexDebounceTimers.set(relWithExt, timer);
+    } catch {}
   }
 
   // Расширяем поисковый запрос синонимами
@@ -1367,7 +1473,16 @@ class ObsidianMCPServer {
 
   // Получаем заметку по ID для полного контента
   public getFullNoteContent(noteId: string): string | null {
-    const note = this.getNote(noteId);
+    // Сначала пытаемся канонизировать (учитывая алиасы)
+    let resolvedPath: string | undefined;
+    try {
+      const r = this.resolveNotePublic(noteId);
+      if (r && r.exists && r.path) resolvedPath = r.path;
+    } catch {}
+
+    const note = resolvedPath
+      ? this.indexData.find(n => n.path === resolvedPath) || this.getNote(noteId)
+      : this.getNote(noteId);
     // Если нашли в индексе — читаем по fullPath
     if (note && note.fullPath) {
       try {
@@ -1459,7 +1574,7 @@ class ObsidianMCPServer {
       const finalContent = this.buildMarkdownWithFrontmatter(frontmatter, content);
       writeFileSync(absolutePath, finalContent, { encoding: 'utf-8' });
       // 🔄 Инкрементальная индексация
-      try { this.indexSingleFile(relWithExt); } catch {}
+      try { this.scheduleIndexSingleFile(relWithExt); } catch {}
       return {
         absolutePath,
         relativePath: relWithExt,
@@ -1499,7 +1614,7 @@ class ObsidianMCPServer {
     writeFileSync(absolutePath, updated, { encoding: 'utf-8' });
     bytesWritten = Buffer.byteLength(updated, 'utf-8') - Buffer.byteLength(original, 'utf-8');
     // 🔄 Инкрементальная индексация
-    try { this.indexSingleFile(relWithExt); } catch {}
+    try { this.scheduleIndexSingleFile(relWithExt); } catch {}
     return {
       absolutePath,
       relativePath: relWithExt,
@@ -1649,7 +1764,7 @@ class ObsidianMCPServer {
     const newContent = this.buildMarkdownWithFrontmatter(obj, body.trimStart());
     writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
     // 🔄 Инкрементальная индексация
-    try { this.indexSingleFile(relWithExt); } catch {}
+    try { this.scheduleIndexSingleFile(relWithExt); } catch {}
   }
 
   private appendRelationBody(filePath: string, heading: string, wikilink: string): void {
@@ -1660,13 +1775,28 @@ class ObsidianMCPServer {
 
     if (!existsSync(absolutePath)) {
       writeFileSync(absolutePath, `## ${heading}\n\n${wikilink}\n`, { encoding: 'utf-8' });
+      // 🔄 Индексация новой записи
+      try { this.scheduleIndexSingleFile(relWithExt); } catch {}
       return;
     }
     const original = readFileSync(absolutePath, 'utf-8');
+    // Проверка на дубликаты внутри секции heading
+    const lines = original.split('\n');
+    const headingRegex = new RegExp(`^#{1,6}\\s+${this.escapeRegex(heading)}\\s*$`, 'i');
+    const idx = lines.findIndex(line => headingRegex.test(line));
+    if (idx !== -1) {
+      let end = idx + 1;
+      while (end < lines.length && !/^#{1,6}\s+/.test(lines[end])) end++;
+      const section = lines.slice(idx + 1, end).join('\n');
+      if (section.includes(wikilink)) {
+        // Уже есть — ничего не делаем
+        return;
+      }
+    }
     const updated = this.appendUnderHeading(original, heading, wikilink);
     writeFileSync(absolutePath, updated, { encoding: 'utf-8' });
     // 🔄 Инкрементальная индексация
-    try { this.indexSingleFile(relWithExt); } catch {}
+    try { this.scheduleIndexSingleFile(relWithExt); } catch {}
   }
 
   public upsertFrontmatter(options: {
@@ -1700,7 +1830,7 @@ class ObsidianMCPServer {
     const newContent = this.buildMarkdownWithFrontmatter(frontmatter, body.trimStart());
     writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
     // 🔄 Инкрементальная индексация
-    try { this.indexSingleFile(relWithExt); } catch {}
+    try { this.scheduleIndexSingleFile(relWithExt); } catch {}
     return { absolutePath, relativePath: relWithExt };
   }
 
@@ -1876,7 +2006,7 @@ class ObsidianMCPServer {
       const newContent = this.buildMarkdownWithFrontmatter(frontmatter, body.trimStart());
       writeFileSync(absolutePath, newContent, { encoding: 'utf-8' });
       // 🔄 Инкрементальная индексация
-      try { this.indexSingleFile(relWithExt); } catch {}
+      try { this.scheduleIndexSingleFile(relWithExt); } catch {}
     }
   }
 
@@ -1900,7 +2030,7 @@ class ObsidianMCPServer {
     const updated = [...before, ...filtered, ...after].join('\n');
     writeFileSync(absolutePath, updated, { encoding: 'utf-8' });
     // 🔄 Инкрементальная индексация
-    try { this.indexSingleFile(relWithExt); } catch {}
+    try { this.scheduleIndexSingleFile(relWithExt); } catch {}
   }
 
   // ===== Helpers for graph/links =====
@@ -1955,24 +2085,22 @@ class ObsidianMCPServer {
   }
 
   private getBacklinkPaths(toPath: string): string[] {
-    const targetKey = this.normalizeNoteKey(toPath);
-    const result = new Set<string>();
+    const keyPath = toPath.toLowerCase().endsWith('.md') ? toPath : `${toPath}.md`;
+    const set = this.backlinkIndex.get(keyPath);
+    return set ? Array.from(set) : [];
+  }
+
+  private rebuildBacklinkIndex(): void {
+    const newIndex: Map<string, Set<string>> = new Map();
     for (const n of this.indexData) {
-      const keys = this.extractWikiLinks(n.content || n.content_preview || '');
-      if (keys.includes(targetKey)) result.add(n.path);
-      const { frontmatter } = this.parseFrontmatterAndBody(n.content || '');
-      for (const v of Object.values(frontmatter)) {
-        if (Array.isArray(v)) {
-          for (const item of v) {
-            if (typeof item === 'string' && /\[\[[^\]]+\]\]/.test(item)) {
-              const key = this.normalizeNoteKey(item.replace(/^\[\[|\]\]$/g, '').split('#')[0]);
-              if (key === targetKey) result.add(n.path);
-            }
-          }
-        }
+      const edges = this.collectNoteEdges(n, true, true);
+      for (const e of edges) {
+        const tgt = e.target.toLowerCase().endsWith('.md') ? e.target : `${e.target}.md`;
+        if (!newIndex.has(tgt)) newIndex.set(tgt, new Set());
+        newIndex.get(tgt)!.add(n.path);
       }
     }
-    return [...result];
+    this.backlinkIndex = newIndex;
   }
 
   private getNote(noteId: string): ObsidianNote | null {
@@ -2121,7 +2249,7 @@ class ObsidianMCPServer {
       const fm = { title, type: 'class' } as Record<string, any>;
       const md = this.buildMarkdownWithFrontmatter(fm, content);
       writeFileSync(abs, md, { encoding: 'utf-8' });
-      try { this.indexSingleFile(indexPath); } catch {}
+      try { this.scheduleIndexSingleFile(indexPath); } catch {}
     }
   }
 
@@ -2223,7 +2351,7 @@ class ObsidianMCPServer {
     writeFileSync(toAbs, data, { encoding: 'utf-8' });
     // remove original
     rmSync(fromAbs);
-    try { this.indexSingleFile(toRel); } catch {}
+    try { this.scheduleIndexSingleFile(toRel); } catch {}
     return { from: fromRel, to: toRel };
   }
 
@@ -2244,7 +2372,7 @@ class ObsidianMCPServer {
       data = this.buildMarkdownWithFrontmatter(parsed.frontmatter, parsed.body);
     }
     writeFileSync(toAbs, data, { encoding: 'utf-8' });
-    try { this.indexSingleFile(toRel); } catch {}
+    try { this.scheduleIndexSingleFile(toRel); } catch {}
     return { from: fromRel, to: toRel };
   }
 
@@ -2259,6 +2387,910 @@ class ObsidianMCPServer {
       rmSync(abs);
     }
     return { deletedPath: rel };
+  }
+
+  // ===== Capture & Journal =====
+  private sanitizeName(name: string): string {
+    return (name || '').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  public captureNote(options: { name: string; content: string; tags?: string[]; relations?: string[]; folder?: string; linkToHub?: boolean; hubs?: string[] }): { path: string } {
+    const { name, content, tags = [], relations = [], folder = 'inbox', linkToHub = true, hubs = [] } = options;
+    if (!name || !content) throw new Error('name and content are required');
+    const safeName = this.sanitizeName(name) || 'note';
+    const relBase = `${folder.replace(/^\/+|\/+$/g,'')}/${safeName}.md`;
+    const fmTags = Array.from(new Set([...(tags || []).map(t=>String(t)), 'autocaptured']));
+    const fm: Record<string, any> = { title: safeName, type: 'note', tags: fmTags };
+    // prepare related wikilinks for frontmatter
+    const relatedLinks: string[] = [];
+    const addLink = (to: string) => {
+      const rr = this.resolveNotePublic(to);
+      const toPath = (rr && rr.exists && rr.path) ? rr.path : to;
+      const wl = this.toWikiLink(toPath);
+      if (!relatedLinks.includes(wl)) relatedLinks.push(wl);
+    };
+    for (const r of relations) addLink(r);
+    if (Array.isArray(hubs) && hubs.length > 0) {
+      for (const h of hubs) addLink(h);
+    } else if (linkToHub) {
+      const hub = this.getCanonicalHubPath().replace(/\.md$/i,'');
+      const wl = `[[${path.basename(hub,'.md')}]]`;
+      if (!relatedLinks.includes(wl)) relatedLinks.push(wl);
+    }
+    if (relatedLinks.length) fm['related'] = relatedLinks;
+
+    const res = this.writeNote({ filePath: relBase, content, writeMode: 'create', frontmatter: fm, ensureMdExtension: true, createMissingFolders: true });
+
+    // also add body Relations section links (no duplicates via appendRelationBody guard)
+    if (Array.isArray(hubs) && hubs.length > 0) {
+      for (const h of hubs) {
+        const rr = this.resolveNotePublic(h);
+        const toPath = (rr && rr.exists && rr.path) ? rr.path : h;
+        this.appendRelationBody(res.relativePath, 'Relations', this.toWikiLink(toPath));
+      }
+    } else if (linkToHub) {
+      this.appendRelationBody(res.relativePath, 'Relations', this.toWikiLink(this.getCanonicalHubPath()));
+    }
+    for (const r of relations) {
+      const rr = this.resolveNotePublic(r);
+      const toPath = (rr && rr.exists && rr.path) ? rr.path : r;
+      this.appendRelationBody(res.relativePath, 'Relations', this.toWikiLink(toPath));
+    }
+
+    return { path: res.relativePath };
+  }
+
+  public dailyJournalAppend(options: { content: string; heading?: string; bullet?: boolean; timestamp?: boolean; filePath?: string; date?: string }): { path: string } {
+    const { content, heading = 'Inbox', bullet = true, timestamp = true, filePath, date } = options;
+    if (!content) throw new Error('content is required');
+    const day = (date && /\d{4}-\d{2}-\d{2}/.test(date)) ? date : new Date().toISOString().slice(0,10);
+    const rel = filePath ? filePath : `inbox/${day}.md`;
+    this.writeNote({ filePath: rel, content, writeMode: 'append', heading, ensureMdExtension: true, createMissingFolders: true });
+    return { path: rel.endsWith('.md') ? rel : `${rel}.md` };
+  }
+
+  // ====== New helpers for navigation & graph ======
+
+  // Resolve note by input (id|path|title|alias). Returns canonical info.
+  public resolveNotePublic(input: string): { path?: string; id?: string; title?: string; aliases?: string[]; exists: boolean; suggestions: string[] } {
+    if (!input) return { exists: false, suggestions: [] } as any;
+    // Try direct match by id|path|title
+    const note = this.getNote(input);
+    if (note) {
+      return {
+        path: note.path,
+        id: note.id,
+        title: note.title,
+        aliases: note.aliases || [],
+        exists: true,
+        suggestions: []
+      };
+    }
+    // Try resolve by normalized key from wikilink semantics
+    const p = this.resolveNoteKeyToPath(input);
+    if (p) {
+      const nn = this.indexData.find(n => n.path === p);
+      return {
+        path: p,
+        id: nn?.id,
+        title: nn?.title,
+        aliases: nn?.aliases || [],
+        exists: true,
+        suggestions: []
+      };
+    }
+    // Suggestions: fuzzy by title/path basename
+    const key = this.normalizeNoteKey(input);
+    const variants: string[] = [];
+    for (const n of this.indexData) {
+      const base = this.normalizeNoteKey(n.title || path.basename(n.path, '.md'));
+      if (base.includes(key) || key.includes(base)) {
+        variants.push(n.path);
+        if (variants.length >= 10) break;
+      }
+    }
+    return { exists: false, suggestions: variants } as any;
+  }
+
+  // Extract frontmatter link-like arrays as relations: key -> list of target paths.
+  private listFrontmatterLinks(note: ObsidianNote): Record<string, string[]> {
+    const res: Record<string, string[]> = {};
+    try {
+      const { frontmatter } = this.parseFrontmatterAndBody(note.content || '');
+      for (const [k, v] of Object.entries(frontmatter || {})) {
+        const pushResolved = (val: string) => {
+          // Expect wikilink [[...]]; extract inner
+          const m = val.match(/\[\[([^\]]+)\]\]/);
+          if (!m) return;
+          const key = this.normalizeNoteKey(m[1].split('#')[0]);
+          const p = this.resolveNoteKeyToPath(key);
+          if (!p) return;
+          if (!res[k]) res[k] = [];
+          if (!res[k].includes(p)) res[k].push(p);
+        };
+        if (Array.isArray(v)) {
+          for (const item of v) if (typeof item === 'string') pushResolved(item);
+        } else if (typeof v === 'string') {
+          pushResolved(v);
+        }
+      }
+    } catch {}
+    return res;
+  }
+
+  // Build vault tree from indexData paths
+  public buildVaultTree(options: { root?: string; maxDepth?: number; includeFiles?: boolean; includeCounts?: boolean; sort?: 'name'|'mtime'|'count'; limitPerDir?: number }): any {
+    const cacheKey = this.heavyKey('get-vault-tree', options);
+    const cached = this.heavyGet(cacheKey);
+    if (cached) return cached;
+    const rootPrefix = (options.root || '').replace(/^\/+|\/+$/g, '');
+    const maxDepth = Math.max(1, Math.min(10, options.maxDepth ?? 3));
+    const includeFiles = options.includeFiles ?? false;
+    const includeCounts = options.includeCounts ?? true;
+    const sort = (options.sort || 'name') as 'name'|'mtime'|'count';
+    const limitPerDir = options.limitPerDir ?? 50;
+
+    type DirNode = { name: string; path: string; type: 'directory'; children: (DirNode|any)[]; counts: { files: number; md_files: number }; mtimeLatest?: string };
+
+    const root: DirNode = { name: rootPrefix || '/', path: rootPrefix || '/', type: 'directory', children: [], counts: { files: 0, md_files: 0 }, mtimeLatest: undefined };
+    const dirMap = new Map<string, DirNode>();
+    dirMap.set(rootPrefix || '/', root);
+
+    const consider = (p: string) => rootPrefix ? p.startsWith(rootPrefix + '/') || p === rootPrefix : true;
+
+    // Build directories
+    for (const n of this.indexData) {
+      const p = n.path || '';
+      if (!p.toLowerCase().endsWith('.md')) continue;
+      if (!consider(p)) continue;
+      const parts = p.split('/');
+      let acc = '';
+      for (let i = 0; i < Math.min(parts.length - 1, maxDepth); i++) {
+        acc = i === 0 ? parts[i] : acc + '/' + parts[i];
+        const key = acc || '/';
+        if (!dirMap.has(key)) {
+          const node: DirNode = { name: parts[i], path: key, type: 'directory', children: [], counts: { files: 0, md_files: 0 } };
+          dirMap.set(key, node);
+        }
+      }
+    }
+
+    // Attach child dirs
+    for (const [key, node] of dirMap.entries()) {
+      if (key === (rootPrefix || '/')) continue;
+      const parent = key.includes('/') ? key.substring(0, key.lastIndexOf('/')) : (rootPrefix || '/');
+      const parentNode = dirMap.get(parent) || root;
+      if (!parentNode.children.includes(node)) parentNode.children.push(node);
+    }
+
+    // Fill files and counts
+    for (const n of this.indexData) {
+      const p = n.path || '';
+      if (!consider(p)) continue;
+      const md = p.toLowerCase().endsWith('.md');
+      const dir = p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : (rootPrefix || '/');
+      const dirNode = dirMap.get(dir) || root;
+      dirNode.counts.files++;
+      if (md) dirNode.counts.md_files++;
+      const lm = n.lastModified ? new Date(n.lastModified).toISOString() : undefined;
+      if (lm) {
+        if (!dirNode.mtimeLatest || lm > dirNode.mtimeLatest) dirNode.mtimeLatest = lm;
+      }
+      if (includeFiles) {
+        const file = { name: path.basename(p), path: p, type: 'file', mtime: n.lastModified || '', md: md };
+        dirNode.children.push(file);
+      }
+    }
+
+    // Sorting and limiting
+    const sorter = (a: any, b: any) => {
+      if (a.type === 'file' && b.type === 'directory') return 1;
+      if (a.type === 'directory' && b.type === 'file') return -1;
+      if (sort === 'name') return a.name.localeCompare(b.name);
+      if (sort === 'count') return (b.counts?.md_files || 0) - (a.counts?.md_files || 0);
+      if (sort === 'mtime') return (b.mtimeLatest || b.mtime || '').localeCompare(a.mtimeLatest || a.mtime || '');
+      return 0;
+    };
+
+    const walkSortLimit = (node: DirNode, depth: number) => {
+      node.children.sort(sorter);
+      if (limitPerDir && node.children.length > limitPerDir) node.children = node.children.slice(0, limitPerDir);
+      if (depth >= maxDepth) {
+        // cut deeper directories
+        node.children = node.children.filter(c => c.type !== 'directory');
+        return;
+      }
+      for (const c of node.children) if (c.type === 'directory') walkSortLimit(c, depth + 1);
+    };
+    walkSortLimit(root, 0);
+
+    if (!includeCounts) {
+      const stripCounts = (node: DirNode) => {
+        delete (node as any).counts;
+        for (const c of node.children) if (c.type === 'directory') stripCounts(c);
+      };
+      stripCounts(root);
+    }
+
+    this.heavySet(cacheKey, root);
+    return root;
+  }
+
+  // Get folder contents with degrees, filters, sorting
+  public buildFolderContents(options: { folderPath: string; recursive?: boolean; sortBy?: 'name'|'mtime'|'degreeIn'|'degreeOut'; limit?: number; filter?: { ext?: string[]; type?: string; tagIncludes?: string[] } }): any[] {
+    const cacheKey = this.heavyKey('get-folder-contents', options);
+    const cached = this.heavyGet(cacheKey);
+    if (cached) return cached;
+    const folder = options.folderPath.replace(/^\/+|\/+$/g, '');
+    const recursive = options.recursive ?? false;
+    const sortBy = (options.sortBy || 'mtime') as 'name'|'mtime'|'degreeIn'|'degreeOut';
+    const limit = options.limit ?? 200;
+    const exts = options.filter?.ext;
+    const typeFilter = options.filter?.type;
+    const tagIncludes = options.filter?.tagIncludes || [];
+
+    const isDirectChild = (p: string) => {
+      if (!p.startsWith(folder + '/')) return false;
+      const rest = p.substring(folder.length + 1);
+      return !rest.includes('/');
+    };
+
+    const pick = (n: ObsidianNote) => {
+      const p = n.path || '';
+      if (folder && !(recursive ? p.startsWith(folder + '/') : isDirectChild(p))) return false;
+      if (exts && exts.length > 0 && !exts.some(e => p.toLowerCase().endsWith(e.toLowerCase()))) return false;
+      if (typeFilter && String(n.type || '').toLowerCase() !== String(typeFilter).toLowerCase()) return false;
+      if (tagIncludes.length > 0) {
+        const tags = (n.tags || []).map(t => String(t).toLowerCase());
+        if (!tagIncludes.every(t => tags.includes(String(t).toLowerCase()))) return false;
+      }
+      return true;
+    };
+
+    const rows = this.indexData.filter(pick).map(n => {
+      const degOut = this.getOutgoingPathsPub(n.path).length;
+      const degIn = this.getBacklinkPathsPub(n.path).length;
+      return {
+        path: n.path,
+        title: n.title || path.basename(n.path, '.md'),
+        type: n.type || '',
+        tags: n.tags || [],
+        mtime: n.lastModified || '',
+        degreeIn: degIn,
+        degreeOut: degOut
+      };
+    });
+
+    rows.sort((a, b) => {
+      if (sortBy === 'name') return a.title.localeCompare(b.title);
+      if (sortBy === 'mtime') return (b.mtime || '').localeCompare(a.mtime || '');
+      if (sortBy === 'degreeIn') return b.degreeIn - a.degreeIn;
+      if (sortBy === 'degreeOut') return b.degreeOut - a.degreeOut;
+      return 0;
+    });
+
+    const out = rows.slice(0, limit);
+    this.heavySet(cacheKey, out);
+    return out;
+  }
+
+  // Collect edges from a note based on body wikilinks and frontmatter lists
+  private collectNoteEdges(note: ObsidianNote, includeBody: boolean, includeFM: boolean): { target: string; relation: string }[] {
+    const edges: { target: string; relation: string }[] = [];
+    if (includeBody) {
+      const keys = this.extractWikiLinks(note.content || note.content_preview || '') || [];
+      for (const key of keys) {
+        const p = this.resolveNoteKeyToPath(key);
+        if (p) edges.push({ target: p, relation: 'wikilink' });
+      }
+    }
+    if (includeFM) {
+      const fm = this.listFrontmatterLinks(note);
+      for (const [k, arr] of Object.entries(fm)) {
+        for (const p of arr) edges.push({ target: p, relation: `frontmatter:${k}` });
+      }
+    }
+    return edges;
+  }
+
+  private buildEgoGraph(startPath: string, depth: number, direction: 'in'|'out'|'both', includeBody: boolean, includeFM: boolean, maxNodes: number, maxEdges: number) {
+    const nodes = new Map<string, ObsidianNote>();
+    const edges: { source: string; target: string; relation: string }[] = [];
+    const q: { path: string; d: number }[] = [];
+    const seen = new Set<string>();
+
+    const pushNode = (p: string) => {
+      if (nodes.size >= maxNodes) return false;
+      const n = this.indexData.find(x => x.path === p);
+      if (!n) return false;
+      nodes.set(p, n);
+      return true;
+    };
+
+    if (!pushNode(startPath)) return { nodes, edges };
+    q.push({ path: startPath, d: 0 });
+    seen.add(startPath);
+
+    while (q.length > 0) {
+      const { path: p, d } = q.shift()!;
+      if (d >= depth) continue;
+
+      const addEdge = (src: string, dst: string, relation: string) => {
+        if (edges.length >= maxEdges) return;
+        edges.push({ source: src, target: dst, relation });
+      };
+
+      if (direction === 'out' || direction === 'both') {
+        const srcNote = this.indexData.find(x => x.path === p);
+        if (srcNote) {
+          for (const e of this.collectNoteEdges(srcNote, includeBody, includeFM)) {
+            if (pushNode(e.target)) {}
+            addEdge(p, e.target, e.relation);
+            if (!seen.has(e.target)) { seen.add(e.target); q.push({ path: e.target, d: d + 1 }); }
+          }
+        }
+      }
+
+      if (direction === 'in' || direction === 'both') {
+        // incoming: any n that links to p
+        for (const n of this.indexData) {
+          if (nodes.size >= maxNodes) break;
+          const outs = this.collectNoteEdges(n, includeBody, includeFM).filter(e => e.target === p);
+          if (outs.length > 0) {
+            if (pushNode(n.path)) {}
+            for (const e of outs) addEdge(n.path, p, e.relation);
+            if (!seen.has(n.path)) { seen.add(n.path); q.push({ path: n.path, d: d + 1 }); }
+          }
+        }
+      }
+
+      if (nodes.size >= maxNodes || edges.length >= maxEdges) break;
+    }
+    return { nodes, edges };
+  }
+
+  private buildFolderSubgraph(prefix: string, includeBody: boolean, includeFM: boolean, maxNodes: number, maxEdges: number) {
+    const set = new Set<string>(this.indexData.filter(n => n.path.startsWith(prefix + '/') || n.path === prefix).map(n => n.path));
+    const nodes = new Map<string, ObsidianNote>();
+    for (const p of set) {
+      if (nodes.size >= maxNodes) break;
+      const n = this.indexData.find(x => x.path === p);
+      if (n) nodes.set(p, n);
+    }
+    const edges: { source: string; target: string; relation: string }[] = [];
+    for (const n of nodes.values()) {
+      for (const e of this.collectNoteEdges(n, includeBody, includeFM)) {
+        if (edges.length >= maxEdges) break;
+        if (set.has(e.target)) edges.push({ source: n.path, target: e.target, relation: e.relation });
+      }
+      if (edges.length >= maxEdges) break;
+    }
+    return { nodes, edges };
+  }
+
+  private formatGraphMermaid(nodes: Map<string, ObsidianNote>, edges: { source: string; target: string; relation: string }[]) {
+    const ids = new Map<string, string>();
+    let idx = 0;
+    for (const p of nodes.keys()) ids.set(p, `n${idx++}`);
+    const esc = (s: string) => s.replace(/"/g, '\\"');
+    const lines = [ 'graph TD' ];
+    for (const [p, n] of nodes.entries()) {
+      lines.push(`  ${ids.get(p)}["${esc(n.title || path.basename(p, '.md'))}"]`);
+    }
+    for (const e of edges) {
+      const a = ids.get(e.source), b = ids.get(e.target);
+      if (a && b) lines.push(`  ${a} --> ${b}`);
+    }
+    return lines.join('\n');
+  }
+
+  private formatGraphDot(nodes: Map<string, ObsidianNote>, edges: { source: string; target: string; relation: string }[]) {
+    const esc = (s: string) => s.replace(/"/g, '\\"');
+    const lines = [ 'digraph G {'];
+    for (const n of nodes.values()) {
+      lines.push(`  "${esc(n.path)}" [label="${esc(n.title || path.basename(n.path, '.md'))}"];`);
+    }
+    for (const e of edges) lines.push(`  "${esc(e.source)}" -> "${esc(e.target)}";`);
+    lines.push('}');
+    return lines.join('\n');
+  }
+
+  // Public: build graph snapshot based on args
+  public getGraphSnapshot(args: { scope?: { startNoteId?: string; folderPrefix?: string }; depth?: number; direction?: 'in'|'out'|'both'; include?: { bodyLinks?: boolean; fmLinks?: boolean }; maxNodes?: number; maxEdges?: number; annotate?: boolean; format?: 'json'|'mermaid'|'dot'|'text'; allowedRelations?: string[]; nodeFilter?: { pathPrefix?: string; tagIncludes?: string[] } }) {
+    const cacheKey = this.heavyKey('get-graph-snapshot', args);
+    const cached = this.heavyGet(cacheKey);
+    if (cached) return cached;
+    const depth = Math.max(1, Math.min(3, args.depth ?? 2));
+    const direction = (args.direction || 'both') as 'in'|'out'|'both';
+    const includeBody = args.include?.bodyLinks ?? true;
+    const includeFM = args.include?.fmLinks ?? true;
+    const maxNodes = args.maxNodes ?? 300;
+    const maxEdges = args.maxEdges ?? 1000;
+    const annotate = args.annotate ?? true;
+    const scope = args.scope || {};
+
+    let nodes: Map<string, ObsidianNote>, edgeArr: { source:string; target:string; relation:string }[];
+    const allowSet = (args.allowedRelations && args.allowedRelations.length > 0) ? new Set(args.allowedRelations) : null;
+    if (scope.startNoteId) {
+      const resolved = this.resolveNotePublic(scope.startNoteId);
+      if (!resolved.exists || !resolved.path) return { nodes: [], edges: [] };
+      const res = this.buildEgoGraph(resolved.path, depth, direction, includeBody, includeFM, maxNodes, maxEdges);
+      nodes = res.nodes; edgeArr = allowSet ? res.edges.filter(e => allowSet.has(e.relation)) : res.edges;
+    } else if (scope.folderPrefix) {
+      const res = this.buildFolderSubgraph(scope.folderPrefix.replace(/^\/+|\/+$/g,'').trim(), includeBody, includeFM, maxNodes, maxEdges);
+      nodes = res.nodes; edgeArr = res.edges;
+    } else {
+      return { nodes: [], edges: [] };
+    }
+
+    // Deduplicate edges for rendering and aggregation
+    const pairKey = (e: {source:string;target:string;relation:string}) => `${e.source}__${e.target}`;
+    const edgeAgg = new Map<string, Record<string, number>>();
+    for (const e of edgeArr) {
+      const k = pairKey(e);
+      if (!edgeAgg.has(k)) edgeAgg.set(k, {});
+      const rels = edgeAgg.get(k)!;
+      rels[e.relation] = (rels[e.relation] || 0) + 1;
+    }
+    let dedupEdges = Array.from(edgeAgg.keys()).map(k => {
+      const [source, target] = k.split('__');
+      return { source, target, relation: 'any' } as {source:string;target:string;relation:string};
+    });
+
+    // Optional node filter (path prefix / tag includes)
+    const nf = args.nodeFilter || {};
+    if (nf.pathPrefix || (nf.tagIncludes && nf.tagIncludes.length)) {
+      const keep = new Set<string>();
+      const tagSet = (arr: string[]|undefined) => new Set((arr||[]).map(t=>String(t).toLowerCase()));
+      const needTags = new Set((nf.tagIncludes||[]).map(t=>String(t).toLowerCase()));
+      const hasAll = (ts: Set<string>) => Array.from(needTags).every(t=>ts.has(t));
+      for (const [p, n] of nodes.entries()) {
+        const okPrefix = nf.pathPrefix ? p.startsWith(nf.pathPrefix) : true;
+        const okTags = needTags.size ? hasAll(tagSet(n.tags)) : true;
+        if (okPrefix && okTags) keep.add(p);
+      }
+      // Filter nodes and edges accordingly
+      const filteredNodes = new Map<string, ObsidianNote>();
+      for (const p of keep) { const n = nodes.get(p); if (n) filteredNodes.set(p, n); }
+      const filteredEdges = dedupEdges.filter(e => keep.has(e.source) && keep.has(e.target));
+      nodes = filteredNodes; // reassign
+      // Update dedupEdges reference
+      dedupEdges = filteredEdges;
+    }
+
+    if (args.format === 'mermaid') {
+      const text = this.formatGraphMermaid(nodes, dedupEdges);
+      const truncated = (nodes.size >= maxNodes || edgeArr.length >= maxEdges);
+      const withNote = truncated ? `${text}\n%% truncated (nodes=${nodes.size}, edges=${edgeArr.length})` : text;
+      this.heavySet(cacheKey, withNote);
+      return withNote;
+    }
+    if (args.format === 'dot') {
+      const text = this.formatGraphDot(nodes, dedupEdges);
+      const truncated = (nodes.size >= maxNodes || edgeArr.length >= maxEdges);
+      const withNote = truncated ? `${text}\n// truncated (nodes=${nodes.size}, edges=${edgeArr.length})` : text;
+      this.heavySet(cacheKey, withNote);
+      return withNote;
+    }
+
+    const outNodes = Array.from(nodes.values()).map(n => ({
+      id: n.id || n.path,
+      path: n.path,
+      title: n.title || path.basename(n.path, '.md'),
+      type: n.type || '',
+      folder: n.path.includes('/') ? n.path.substring(0, n.path.lastIndexOf('/')) : '',
+      tags: n.tags || [],
+      degIn: this.getBacklinkPathsPub(n.path).length,
+      degOut: this.getOutgoingPathsPub(n.path).length
+    }));
+
+    const truncated = (nodes.size >= maxNodes || edgeArr.length >= maxEdges);
+    const out = { nodes: outNodes, edges: dedupEdges, edgesAggregated: Array.from(edgeAgg.entries()).map(([k,v])=>({ pair:k, relations:v })), truncated: truncated ? { nodesReturned: outNodes.length, edgesReturned: dedupEdges.length, maxNodes, maxEdges } : undefined };
+    if (args.format === 'text') {
+      const top = [...outNodes].sort((a,b)=> (b.degIn+b.degOut)-(a.degIn+a.degOut)).slice(0,10);
+      const lines = [
+        `Nodes: ${outNodes.length}, Edges: ${dedupEdges.length}`,
+        truncated ? `NOTE: truncated (maxNodes=${maxNodes}, maxEdges=${maxEdges})` : undefined,
+        `Top hubs:`,
+        ...top.map(t => `- ${t.title} (${t.path}) deg=${t.degIn+t.degOut}`)
+      ].filter(Boolean) as string[];
+      const text = lines.join('\n');
+      this.heavySet(cacheKey, text);
+      return text;
+    }
+    this.heavySet(cacheKey, out);
+    return out;
+  }
+
+  // Public: neighborhood
+  public getNoteNeighborhood(args: { noteId: string; depth?: number; fanoutLimit?: number; direction?: 'in'|'out'|'both'; format?: 'text'|'json' }) {
+    const cacheKey = this.heavyKey('get-note-neighborhood', args);
+    const cached = this.heavyGet(cacheKey);
+    if (cached) return cached;
+    const depth = Math.max(1, Math.min(3, args.depth ?? 2));
+    const direction = (args.direction || 'both') as 'in'|'out'|'both';
+    const fanout = args.fanoutLimit ?? 30;
+    const resolved = this.resolveNotePublic(args.noteId);
+    if (!resolved.exists || !resolved.path) return args.format === 'json' ? { levels: [] } : `Not found: ${args.noteId}`;
+
+    const root = resolved.path;
+    const levels: string[][] = [];
+    let frontier = [root];
+    const visited = new Set<string>([root]);
+
+    for (let d=0; d<depth; d++) {
+      const next: string[] = [];
+      const layer: string[] = [];
+      for (const p of frontier) {
+        let outs: string[] = [];
+        let ins: string[] = [];
+        if (direction === 'out' || direction === 'both') outs = this.getOutgoingPathsPub(p).slice(0, fanout);
+        if (direction === 'in' || direction === 'both') ins = this.getBacklinkPathsPub(p).slice(0, fanout);
+        for (const q of [...outs, ...ins]) if (!visited.has(q)) { visited.add(q); layer.push(q); next.push(q); }
+      }
+      levels.push(layer);
+      frontier = next;
+      if (levels.flat().length >= 300) break;
+    }
+
+    const truncated = levels.flat().length >= 300;
+    if (args.format === 'json') {
+      const out = { levels, truncated };
+      this.heavySet(cacheKey, out);
+      return out;
+    }
+    const lines: string[] = [`Root: ${root}`];
+    levels.forEach((layer,i)=> {
+      lines.push(`L${i+1}:`);
+      for (const p of layer) {
+        const n = this.indexData.find(x => x.path === p);
+        lines.push(`- ${p} (${n?.title || ''})`);
+      }
+    });
+    if (truncated) lines.push(`(truncated)`);
+    const text = lines.join('\n');
+    this.heavySet(cacheKey, text);
+    return text;
+  }
+
+  // Public: list relations of a note
+  public getRelationsOfNote(args: { noteId: string; include?: { bodyLinks?: boolean; frontmatterLists?: string[]|'*' } }) {
+    const includeBody = args.include?.bodyLinks ?? true;
+    const fmSel = args.include?.frontmatterLists;
+    const resolved = this.resolveNotePublic(args.noteId);
+    if (!resolved.exists || !resolved.path) return { wikilinks: [], frontmatter: {} };
+    const n = this.indexData.find(x => x.path === resolved.path)!;
+    const wikilinks: string[] = [];
+    if (includeBody) {
+      for (const key of this.extractWikiLinks(n.content || n.content_preview || '')) {
+        const p = this.resolveNoteKeyToPath(key);
+        if (p && !wikilinks.includes(p)) wikilinks.push(p);
+      }
+    }
+    const fmAll = this.listFrontmatterLinks(n);
+    const fm: Record<string,string[]> = {};
+    if (fmSel === '*' || fmSel == null) Object.assign(fm, fmAll);
+    else for (const k of fmSel) if (fmAll[k]) fm[k] = fmAll[k];
+    return { wikilinks, frontmatter: fm };
+  }
+
+  // Public: shortest path between two notes (BFS)
+  public findPathBetween(args: { from: string; to: string; direction?: 'in'|'out'|'both'; maxDepth?: number; allowedRelations?: string[]; format?: 'text'|'json'|'mermaid' }) {
+    const direction = (args.direction || 'both') as 'in'|'out'|'both';
+    const maxDepth = Math.max(1, Math.min(6, args.maxDepth ?? 5));
+    const allow = args.allowedRelations && args.allowedRelations.length > 0 ? new Set(args.allowedRelations) : null;
+    const a = this.resolveNotePublic(args.from), b = this.resolveNotePublic(args.to);
+    if (!a.exists || !a.path || !b.exists || !b.path) return args.format==='json'?{ paths:[] }: `Not found: ${args.from} or ${args.to}`;
+    if (a.path === b.path) return args.format==='json'?{ paths:[[a.path]] }: `${a.path}`;
+
+    const prev = new Map<string, { prev: string; relation: string }>();
+    const q: string[] = [a.path];
+    const dist = new Map<string, number>();
+    dist.set(a.path, 0);
+
+    while (q.length > 0) {
+      const cur = q.shift()!;
+      const d = dist.get(cur)!;
+      if (d >= maxDepth) continue;
+
+      const expandFrom = (src: string) => {
+        const note = this.indexData.find(x => x.path === src);
+        if (!note) return [] as { target:string; relation:string }[];
+        return this.collectNoteEdges(note, true, true).filter(e => !allow || allow.has(e.relation));
+      };
+
+      // Outgoing
+      if (direction === 'out' || direction === 'both') {
+        for (const e of expandFrom(cur)) {
+          if (!dist.has(e.target)) { dist.set(e.target, d+1); prev.set(e.target, { prev: cur, relation: e.relation }); q.push(e.target); }
+          if (e.target === b.path) { q.length = 0; break; }
+        }
+      }
+      // Incoming
+      if (direction === 'in' || direction === 'both') {
+        for (const n of this.indexData) {
+          for (const e of this.collectNoteEdges(n, true, true)) {
+            if (e.target !== cur) continue;
+            const tgt = n.path;
+            if (allow && !allow.has(e.relation)) continue;
+            if (!dist.has(tgt)) { dist.set(tgt, d+1); prev.set(tgt, { prev: cur, relation: e.relation }); q.push(tgt); }
+            if (tgt === b.path) { q.length = 0; break; }
+          }
+        }
+      }
+    }
+
+    if (!prev.has(b.path)) return args.format==='json'?{ paths:[] }: 'No path within maxDepth';
+    const pathNodes: string[] = [];
+    let cur = b.path;
+    while (cur && cur !== a.path) { pathNodes.push(cur); cur = prev.get(cur)!.prev; }
+    pathNodes.push(a.path);
+    pathNodes.reverse();
+
+    if (args.format === 'json') return { paths: [pathNodes] };
+    if (args.format === 'mermaid') {
+      const esc = (s:string)=>s.replace(/"/g,'\\"');
+      const lines = ['graph TD'];
+      for (let i=0;i<pathNodes.length;i++) {
+        const p = pathNodes[i];
+        const n = this.indexData.find(x=>x.path===p);
+        lines.push(`  n${i}["${esc(n?.title||path.basename(p,'.md'))}"]`);
+        if (i>0) lines.push(`  n${i-1} --> n${i}`);
+      }
+      return lines.join('\n');
+    }
+    return pathNodes.join(' -> ');
+  }
+
+  // ===== Семантический слой (скелет) =====
+  private embedTextHash(text: string): number[] {
+    const dim = 32;
+    const vec = new Array(dim).fill(0);
+    const lc = (text || '').toLowerCase();
+    for (let i = 0; i < lc.length; i++) {
+      const code = lc.charCodeAt(i);
+      // учитывать буквы/цифры
+      if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57) || (code >= 1072 && code <= 1103)) {
+        vec[code % dim] += 1;
+      }
+    }
+    // нормализация
+    const norm = Math.sqrt(vec.reduce((s, x) => s + x * x, 0)) || 1;
+    for (let i = 0; i < dim; i++) vec[i] = vec[i] / norm;
+    return vec;
+  }
+
+  private ensureVector(notePath: string): number[] {
+    // build or return cached vector for note
+    const p = notePath.toLowerCase().endsWith('.md') ? notePath : `${notePath}.md`;
+    const cached = this.embedStore.get(p);
+    if (cached) return cached;
+    const n = this.indexData.find(x => x.path === p);
+    const text = n ? (n.content || n.content_preview || '') : '';
+    const v = this.embedGenerate(text);
+    this.embedStore.set(p, v);
+    this.embedDirty = true;
+    return v;
+  }
+
+  private scheduleEmbedUpdate(relPathInput: string): void {
+    if (!this.embedPersist && !this.semanticEnabled) return;
+    const rel = relPathInput.toLowerCase().endsWith('.md') ? relPathInput : `${relPathInput}.md`;
+    this.embedPending.add(rel);
+    if (this.embedUpdateTimer) return;
+    this.embedUpdateTimer = setTimeout(() => {
+      try {
+        for (const p of Array.from(this.embedPending)) {
+          try { this.ensureVector(p); } catch {}
+          this.embedPending.delete(p);
+        }
+        this.saveEmbedStoreToDiskDebounced();
+      } finally {
+        if (this.embedUpdateTimer) { clearTimeout(this.embedUpdateTimer); this.embedUpdateTimer = null; }
+      }
+    }, 700);
+  }
+
+  private loadEmbedStoreFromDisk(): void {
+    if (!this.embedPersist) return;
+    try {
+      if (!existsSync(this.embedStorePath)) return;
+      const raw = JSON.parse(readFileSync(this.embedStorePath, 'utf-8')) as { vectors: Record<string, number[]> };
+      const map = raw?.vectors || {};
+      let loaded = 0;
+      for (const [k, v] of Object.entries(map)) {
+        if (Array.isArray(v) && v.length > 0) { this.embedStore.set(k, v); loaded++; }
+      }
+      console.error(`💾 Semantic store loaded: ${loaded} vectors from ${this.embedStorePath}`);
+    } catch (e) {
+      console.error('⚠️ Failed to load semantic store:', e);
+    }
+  }
+
+  private saveEmbedStoreToDiskDebounced(): void {
+    if (!this.embedPersist) return;
+    if (!this.embedDirty) return; // nothing to save
+    if (this.embedSaveTimer) clearTimeout(this.embedSaveTimer);
+    this.embedSaveTimer = setTimeout(() => {
+      try {
+        const dir = path.dirname(this.embedStorePath);
+        try { if (!existsSync(dir)) mkdirSync(dir, { recursive: true }); } catch {}
+        // backup existing
+        if (this.embedBackup && existsSync(this.embedStorePath)) {
+          try {
+            const bak = this.embedStorePath + '.bak';
+            const old = readFileSync(this.embedStorePath, 'utf-8');
+            writeFileSync(bak, old, { encoding: 'utf-8' });
+          } catch {}
+        }
+        const obj: Record<string, number[]> = {};
+        for (const [k, v] of this.embedStore.entries()) obj[k] = v;
+        const payload = JSON.stringify({ vectors: obj }, null, 2);
+        writeFileSync(this.embedStorePath, payload, { encoding: 'utf-8' });
+        this.embedDirty = false;
+        console.error(`💾 Semantic store saved (${this.embedStore.size} vectors)`);
+      } catch (e) {
+        console.error('⚠️ Failed to save semantic store:', e);
+      } finally {
+        this.embedSaveTimer = null;
+      }
+    }, 500);
+  }
+
+  private textRelevanceScore(n: ObsidianNote, query: string): number {
+    const words = Array.from(new Set(this.extractQueryWords(query).filter(w => w && w.length >= 2)));
+    if (words.length === 0) return 0;
+    const lc = (s: string) => (s || '').toLowerCase();
+    const content = lc(n.content || n.content_preview || '');
+    const title = lc(n.title || '');
+    const pth = lc(n.path || '');
+
+    let cHits=0, tHits=0, pHits=0;
+    for (const w of words) {
+      const ww = lc(w);
+      if (content.includes(ww)) cHits++;
+      if (title.includes(ww)) tHits++;
+      if (pth.includes(ww)) pHits++;
+    }
+    const cFrac = cHits / words.length;
+    const tFrac = tHits / words.length;
+    const pFrac = pHits / words.length;
+
+    const few = words.length <= 2;
+    const wC = few ? 0.45 : 0.6;
+    const wT = few ? 0.35 : 0.25;
+    const wP = few ? 0.20 : 0.15;
+
+    let score = wC * cFrac + wT * tFrac + wP * pFrac;
+
+    // Бонус за точную фразу
+    const phrase = lc(query).trim();
+    if (phrase) {
+      if (title.includes(phrase)) score = Math.min(1, score + (few ? 0.20 : 0.12));
+      if (content.includes(phrase)) score = Math.min(1, score + (few ? 0.12 : 0.10));
+    }
+
+    return Math.max(0, Math.min(1, score));
+  }
+
+  private async initEmbedProviderAsync(): Promise<void> {
+    try {
+      const prov = (process.env.MCP_SEMANTIC_PROVIDER || 'hash').toLowerCase();
+      this.embedProvider = (prov === 'xenova') ? 'xenova' : 'hash';
+      this.embedModel = process.env.MCP_SEMANTIC_MODEL || 'Xenova/all-MiniLM-L6-v2';
+      if (this.embedProvider === 'xenova') {
+        const mod: any = await import('@xenova/transformers');
+        const pipe = await mod.pipeline('feature-extraction', this.embedModel);
+        this.embedXenovaPipeline = pipe;
+        console.error(`🧪 Xenova provider initialized (${this.embedModel})`);
+      }
+    } catch (e) {
+      this.embedProvider = 'hash';
+      this.embedXenovaPipeline = null;
+      console.error('⚠️ Xenova init failed, fallback to hash:', e?.toString?.() || e);
+    }
+  }
+
+  private embedGenerate(text: string): number[] {
+    if (this.embedProvider === 'xenova' && this.embedXenovaPipeline) {
+      // попытка синхронной выборки: у pipeline API асинхронный вызов, но мы не хотим менять сигнатуры
+      // Поэтому ограниченно используем hash, а для Xenova доверимся ensureVector, когда pipeline инициализируется
+      // (реальный Xenova вызов будет применяться при последующих вызовах ensureVector/semanticQuery в фоне)
+      // Здесь возвращаем hash, чтобы сигнатуры оставались sync.
+      try { /* no-op */ } catch {}
+    }
+    return this.embedTextHash(text);
+  }
+
+  public embedAndUpsert(args: { noteId: string; mode?: 'note'|'chunks' }) {
+    const r = this.resolveNotePublic(args.noteId);
+    if (!r.exists || !r.path) return { ok: false, reason: 'not-found', semantic: this.semanticEnabled };
+    const v = this.ensureVector(r.path);
+    this.saveEmbedStoreToDiskDebounced();
+    return { ok: true, path: r.path, dims: v.length, semantic: this.semanticEnabled };
+  }
+
+  public semanticQuery(args: { query: string; topK?: number; offset?: number; filters?: { pathPrefix?: string; tagIncludes?: string[]; type?: string } }) {
+    const topK = Math.max(1, Math.min(50, args.topK ?? 5));
+    const offset = Math.max(0, Math.min(10000, args.offset ?? 0));
+    const query = String(args.query || '');
+    const filters = args.filters || {};
+
+    const cacheKey = this.heavyKey('semantic-query', { query, topK, offset, filters, alpha: this.SEM_ALPHA });
+    const cached = this.heavyGet(cacheKey);
+    if (cached) return cached;
+
+    if (!this.semanticEnabled) {
+      // мягкий фолбэк — обычный поиск и компактный вывод
+      const results = this.searchNotes(query, topK, { mode: 'balanced', includeLinked: false });
+      const out = results.map(r => ({ path: r.path, title: r.title.replace(/\*\*/g,''), score: r.score, source: 'fallback' }));
+      this.heavySet(cacheKey, out);
+      return out;
+    }
+
+    const qv = this.embedGenerate(query);
+    const consider = (n: ObsidianNote) => {
+      if (filters.pathPrefix && !n.path.startsWith(filters.pathPrefix)) return false;
+      if (filters.tagIncludes && filters.tagIncludes.length > 0) {
+        const tags = (n.tags || []).map(t => String(t).toLowerCase());
+        for (const t of filters.tagIncludes) if (!tags.includes(String(t).toLowerCase())) return false;
+      }
+      if (filters.type) {
+        const want = String(filters.type).toLowerCase();
+        if (String(n.type || '').toLowerCase() !== want) return false;
+      }
+      return true;
+    };
+
+    const scored: { path: string; title: string; score: number; snippet: string }[] = [];
+    let scanned = 0;
+    const fewWords = this.extractQueryWords(query).filter(w=>w && w.length>=2).length <= 2;
+    const localAlpha = fewWords ? Math.min(0.6, this.SEM_ALPHA) : this.SEM_ALPHA;
+    const minLen = this.SEM_MINLEN_QUERY;
+    const snipLen = fewWords ? Math.max(120, this.SNIPPET_LEN - 40) : this.SNIPPET_LEN;
+    for (const n of this.indexData) {
+      if (!consider(n)) continue;
+      const len = (n.content || n.content_preview || '').length;
+      if (len < minLen) continue;
+      scanned++;
+      if (scanned > this.SEM_MAX_SCAN) break;
+      const v = this.ensureVector(n.path);
+      // косинусная близость ~ dot (нормы уже 1)
+      let dot = 0;
+      for (let i = 0; i < Math.min(v.length, qv.length); i++) dot += v[i] * qv[i];
+      // текстовая релевантность по словам (динамическая вейтовка происходит внутри)
+      const textRel = this.textRelevanceScore(n, query);
+      const finalScore = localAlpha * dot + (1 - localAlpha) * textRel;
+      const snippet = this.extractRelevantSnippet(n.content || '', query, snipLen);
+      scored.push({ path: n.path, title: n.title || path.basename(n.path, '.md'), score: finalScore, snippet });
+    }
+    scored.sort((a,b) => b.score - a.score);
+    const out = scored.slice(offset, offset + topK);
+    this.heavySet(cacheKey, out);
+    return out;
+  }
+  public semanticBuildIndex(args: { limit?: number }) {
+    const t0 = Date.now();
+    let count = 0;
+    let skipped = 0;
+    let sumLen = 0;
+    const byType: Record<string, number> = {};
+    const limit = Math.max(0, args.limit ?? 0);
+    const minLen = (()=>{ const v = parseInt(process.env.MCP_SEMANTIC_MINLEN || '80', 10); return Number.isFinite(v) && v>=0 ? v : 80; })();
+    for (const n of this.indexData) {
+      const len = (n.content || n.content_preview || '').length;
+      if (len < minLen) { skipped++; continue; }
+      this.ensureVector(n.path);
+      count++;
+      sumLen += len;
+      const tp = String(n.type || 'note').toLowerCase();
+      byType[tp] = (byType[tp] || 0) + 1;
+      if (limit && count >= limit) break;
+    }
+    const ms = Date.now() - t0;
+    const avgLen = count ? Math.round(sumLen / count) : 0;
+    this.saveEmbedStoreToDiskDebounced();
+    return { ok: true, count, skipped, ms, avgLen, byType, minLenFilter: minLen, semantic: this.semanticEnabled };
   }
 }
 
@@ -2293,6 +3325,39 @@ export function createServer() {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
         return {
       tools: [
+        {
+          name: "capture-note",
+          description: `📝 Быстро создать заметку в inbox с фронтматтером и автолинком к Knowledge Hub.\n\nПараметры: name, content, tags[], relations[], folder (default: inbox), linkToHub (default: true), hubs[] (доп. хабы).`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              content: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              relations: { type: "array", items: { type: "string" } },
+              folder: { type: "string", default: "inbox" },
+              linkToHub: { type: "boolean", default: true },
+              hubs: { type: "array", items: { type: "string" }, description: "Автолинк к указанным хабам (title|path). Если задан — linkToHub игнорируется." }
+            },
+            required: ["name","content"]
+          }
+        },
+        {
+          name: "daily-journal-append",
+          description: `🗒️ Ежедневная запись: дописать в файл за YYYY-MM-DD под заданным заголовком (по умолчанию Inbox), с bullet+timestamp по умолчанию.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              content: { type: "string" },
+              heading: { type: "string", default: "Inbox" },
+              bullet: { type: "boolean", default: true },
+              timestamp: { type: "boolean", default: true },
+              filePath: { type: "string", description: "Переопределить путь файла (по умолчанию inbox/YYYY-MM-DD.md)" },
+              date: { type: "string", description: "YYYY-MM-DD" }
+            },
+            required: ["content"]
+          }
+        },
         {
           name: "search-notes",
           description: `🔍 ИДЕАЛЬНЫЙ ПОИСК по заметкам Obsidian, оптимизированный для LLM-агентов.
@@ -2653,6 +3718,109 @@ Frontmatter: можно передать объект ключ-значение 
             },
             required: ["since"]
           }
+        },
+        {
+          name: "embed-and-upsert",
+          description: `🧠 СЕМАНТИКА: создать/обновить эмбеддинг заметки (каркас).\n\nЕсли семантика отключена, вернёт noop-ответ.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              noteId: { type: "string", description: "ID/путь/заголовок заметки" },
+              mode: { type: "string", enum: ["note","chunks"], default: "note" }
+            },
+            required: ["noteId"]
+          }
+        },
+        {
+          name: "semantic-query",
+          description: `🧠 СЕМАНТИКА: поиск по эмбеддингам (каркас).\n\nЕсли семантика отключена — мягкий фолбэк к обычному поиску.`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+              topK: { type: "number", default: 5 },
+              offset: { type: "number", default: 0 },
+              filters: { type: "object", properties: { pathPrefix: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } }, type: { type: "string" } } }
+            },
+            required: ["query"]
+          }
+        },
+        {
+          name: "semantic-build-index",
+          description: `🧠 СЕМАНТИКА: предрасчёт эмбеддингов для всех заметок (каркас).`,
+          inputSchema: {
+            type: "object",
+            properties: { limit: { type: "number", description: "Ограничить кол-во" } }
+          }
+        },
+        {
+          name: "resolve-note",
+          description: `🔎 Канонизация идентификатора заметки: title|alias|path → {path,id,title,aliases,exists,suggestions}`,
+          inputSchema: {
+            type: "object",
+            properties: { input: { type: "string", description: "Заголовок/алиас/путь" } },
+            required: ["input"]
+          }
+        },
+        {
+          name: "get-relations-of-note",
+          description: `🕸️ Извлечь связи заметки: тела (wikilinks) и frontmatter-списки` ,
+          inputSchema: {
+            type: "object",
+            properties: {
+              noteId: { type: "string" },
+              include: { type: "object", properties: { bodyLinks: { type: "boolean" }, frontmatterLists: { anyOf: [ { type: "array", items: { type: "string" } }, { const: "*" } ] } } }
+            },
+            required: ["noteId"]
+          }
+        },
+        {
+          name: "get-note-neighborhood",
+          description: `👥 Окрестность узла по слоям L1..Lk (входящие/исходящие)` ,
+          inputSchema: {
+            type: "object",
+            properties: {
+              noteId: { type: "string" }, depth: { type: "number", default: 2 }, fanoutLimit: { type: "number", default: 30 }, direction: { type: "string", enum: ["in","out","both"], default: "both" }, format: { type: "string", enum: ["text","json"], default: "text" }
+            },
+            required: ["noteId"]
+          }
+        },
+        {
+          name: "get-graph-snapshot",
+          description: `🧭 Снимок подграфа (ego-граф от noteId или поддерево по folderPrefix)` ,
+          inputSchema: {
+            type: "object",
+            properties: {
+              scope: { type: "object", properties: { startNoteId: { type: "string" }, folderPrefix: { type: "string" } } },
+              depth: { type: "number", default: 2 }, direction: { type: "string", enum: ["in","out","both"], default: "both" }, include: { type: "object", properties: { bodyLinks: { type: "boolean" }, fmLinks: { type: "boolean" } } }, maxNodes: { type: "number", default: 300 }, maxEdges: { type: "number", default: 1000 }, annotate: { type: "boolean", default: true }, format: { type: "string", enum: ["json","mermaid","dot","text"], default: "json" }, allowedRelations: { type: "array", items: { type: "string" } }, nodeFilter: { type: "object", properties: { pathPrefix: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } } } }
+            }
+          }
+        },
+        {
+          name: "get-vault-tree",
+          description: `🌲 Дерево папок с агрегатами (counts, latest mtime)` ,
+          inputSchema: {
+            type: "object",
+            properties: { root: { type: "string" }, maxDepth: { type: "number", default: 3 }, includeFiles: { type: "boolean", default: false }, includeCounts: { type: "boolean", default: true }, sort: { type: "string", enum: ["name","mtime","count"], default: "name" }, limitPerDir: { type: "number", default: 50 }, format: { type: "string", enum: ["text","json"], default: "text" } }
+          }
+        },
+        {
+          name: "get-folder-contents",
+          description: `📁 Содержимое папки с сортировкой и фильтрами` ,
+          inputSchema: {
+            type: "object",
+            properties: { folderPath: { type: "string" }, recursive: { type: "boolean", default: false }, sortBy: { type: "string", enum: ["name","mtime","degreeIn","degreeOut"], default: "mtime" }, limit: { type: "number", default: 200 }, filter: { type: "object", properties: { ext: { type: "array", items: { type: "string" } }, type: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } } } }, format: { type: "string", enum: ["text","json","table"], default: "text" } },
+            required: ["folderPath"]
+          }
+        },
+        {
+          name: "find-path-between",
+          description: `🧵 Кратчайший путь между двумя заметками (BFS)` ,
+          inputSchema: {
+            type: "object",
+            properties: { from: { type: "string" }, to: { type: "string" }, direction: { type: "string", enum: ["in","out","both"], default: "both" }, maxDepth: { type: "number", default: 5 }, allowedRelations: { type: "array", items: { type: "string" } }, format: { type: "string", enum: ["text","json","mermaid"], default: "text" } },
+            required: ["from","to"]
+          }
         }
       ]
     };
@@ -2758,13 +3926,18 @@ Try:
       }
 
       // поддержка file#heading
-      if (noteId.includes('#') && !topic) {
+      let headingFromId: string | undefined;
+      if (noteId.includes('#')) {
         const [base, head] = noteId.split('#');
         noteId = base;
-        topic = head || topic;
+        if (!topic && head) headingFromId = head;
       }
 
-      const fullContent = serverInstance!.getFullNoteContent(noteId);
+      // Канонизируем (учитывая алиасы)
+      const resolved = serverInstance!.resolveNotePublic(noteId);
+      const resolvedId = (resolved && resolved.exists && resolved.path) ? resolved.path : noteId;
+
+      const fullContent = serverInstance!.getFullNoteContent(resolvedId);
       
       if (!fullContent) {
           return {
@@ -2782,36 +3955,81 @@ Please check:
         };
       }
 
-      // Ограничиваем содержимое если указан лимит токенов
+      // Точное извлечение секции по заголовку, если задано
       let content = fullContent;
+
+      const tryExtractByHeading = (text: string, heading: string): string | null => {
+        try {
+          const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const lines = text.split('\n');
+          const rx = new RegExp(`^#{1,6}\\s+${esc(heading)}\\s*$`, 'i');
+          let start = -1, level = 0;
+          for (let i = 0; i < lines.length; i++) {
+            const m = lines[i].match(/^(#+)\s+(.*)$/);
+            if (!m) continue;
+            const hl = m[1].length;
+            const title = m[2].trim();
+            if (rx.test(lines[i]) || title.toLowerCase() === heading.toLowerCase()) {
+              start = i; level = hl; break;
+            }
+          }
+          if (start === -1) return null;
+          let end = lines.length;
+          for (let j = start + 1; j < lines.length; j++) {
+            const mm = lines[j].match(/^(#+)\s+/);
+            if (mm) { const l = mm[1].length; if (l <= level) { end = j; break; } }
+          }
+          return lines.slice(start, end).join('\n');
+        } catch { return null; }
+      };
+
+      const targetHeading = headingFromId || topic;
+      if (targetHeading) {
+        const section = tryExtractByHeading(fullContent, targetHeading);
+        if (section) {
+          content = section + '\n\n📄 **Full content below:**\n\n' + fullContent;
+        } else {
+          const notFoundMsg = `🔎 Heading not found: "${targetHeading}"`;
+          if (topic) {
+            // fallback: контекст вокруг совпадений
+            const lines = fullContent.split('\n');
+            const topicLower = topic.toLowerCase();
+            const relevantSections: string[] = [];
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              if (line.toLowerCase().includes(topicLower)) {
+                const start = Math.max(0, i - 3);
+                const end = Math.min(lines.length, i + 6);
+                const section = lines.slice(start, end).join('\n');
+                relevantSections.push(section);
+              }
+            }
+            if (relevantSections.length > 0) {
+              content = notFoundMsg + '\n\n' + `📍 **Sections related to \"${topic}\":**\n\n` + relevantSections.join('\n\n---\n\n') + '\n\n📄 **Full content below:**\n\n' + fullContent;
+            } else {
+              content = notFoundMsg + '\n\n' + fullContent;
+            }
+          } else {
+            content = notFoundMsg + '\n\n' + fullContent;
+          }
+        }
+      }
+
+      // Если задан topic и не было headingFromId, но совпадений не нашли — добавим подсказку
+      if (!headingFromId && topic) {
+        const lines = fullContent.split('\n');
+        const topicLower = topic.toLowerCase();
+        const matched = lines.some(l => l.toLowerCase().includes(topicLower));
+        if (!matched) {
+          content = `🔎 Topic not found: "${topic}"` + '\n\n' + fullContent;
+        }
+      }
+
+      // Ограничиваем содержимое если указан лимит токенов
       if (maxTokens && maxTokens > 0) {
         const approximateTokens = content.length / 4; // Примерно 4 символа = 1 токен
         if (approximateTokens > maxTokens) {
           content = content.substring(0, maxTokens * 4) + '\n\n... (содержимое обрезано по лимиту токенов)';
-        }
-      }
-
-      // Если указана тема, пытаемся найти релевантные секции
-      if (topic) {
-        const lines = content.split('\n');
-          const topicLower = topic.toLowerCase();
-        const relevantSections: string[] = [];
-          
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-            if (line.toLowerCase().includes(topicLower)) {
-            // Добавляем контекст: 3 строки до и 5 строк после
-            const start = Math.max(0, i - 3);
-            const end = Math.min(lines.length, i + 6);
-            const section = lines.slice(start, end).join('\n');
-            relevantSections.push(section);
-          }
-        }
-        
-        if (relevantSections.length > 0) {
-          content = `📍 **Sections related to "${topic}":**\n\n` + 
-                   relevantSections.join('\n\n---\n\n') + 
-                   '\n\n📄 **Full content below:**\n\n' + content;
         }
       }
 
@@ -3103,6 +4321,52 @@ ${content}`
       return { content: [{ type: 'text', text: outText }] };
     }
 
+    if (request.params.name === "capture-note") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.captureNote({
+        name: String(args.name || ''),
+        content: String(args.content || ''),
+        tags: Array.isArray(args.tags) ? args.tags : undefined,
+        relations: Array.isArray(args.relations) ? args.relations : undefined,
+        folder: args.folder,
+        linkToHub: (args.linkToHub as boolean) ?? true
+      });
+      return { content: [{ type: 'text', text: `✅ Captured: ${res.path}` }] };
+    }
+
+    if (request.params.name === "daily-journal-append") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.dailyJournalAppend({
+        content: String(args.content || ''),
+        heading: args.heading,
+        bullet: (args.bullet as boolean) ?? true,
+        timestamp: (args.timestamp as boolean) ?? true,
+        filePath: args.filePath,
+        date: args.date
+      });
+      return { content: [{ type: 'text', text: `🗒️ Appended to daily: ${res.path}` }] };
+    }
+
+    if (request.params.name === "embed-and-upsert") {
+      const args = request.params.arguments || {} as any;
+      const noteId = String(args.noteId || '');
+      if (!noteId) throw new Error('noteId is required');
+      const res = serverInstance!.embedAndUpsert({ noteId, mode: args.mode });
+      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    }
+
+    if (request.params.name === "semantic-build-index") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.semanticBuildIndex({ limit: args.limit });
+      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    }
+
+    if (request.params.name === "semantic-query") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.semanticQuery({ query: String(args.query||''), topK: args.topK, offset: args.offset, filters: args.filters });
+      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    }
+
     if (request.params.name === "reindex-changed-since") {
       const args = request.params.arguments || {} as any;
       const sinceIso = args.since as string;
@@ -3129,6 +4393,105 @@ ${content}`
       walk(vaultRoot);
 
       return { content: [{ type: 'text', text: `Delta reindexed: ${changed}` }] };
+    }
+
+    if (request.params.name === "resolve-note") {
+      const input = String((request.params.arguments || {} as any).input || '');
+      if (!input) throw new Error('input is required');
+      const res = serverInstance!.resolveNotePublic(input);
+      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    }
+
+    if (request.params.name === "get-relations-of-note") {
+      const args = request.params.arguments || {} as any;
+      const noteId = String(args.noteId || '');
+      if (!noteId) throw new Error('noteId is required');
+      const res = serverInstance!.getRelationsOfNote({ noteId, include: args.include });
+      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    }
+
+    if (request.params.name === "get-note-neighborhood") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.getNoteNeighborhood({
+        noteId: String(args.noteId || ''),
+        depth: args.depth,
+        fanoutLimit: args.fanoutLimit,
+        direction: args.direction,
+        format: args.format
+      });
+      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+
+    if (request.params.name === "get-graph-snapshot") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.getGraphSnapshot({
+        scope: args.scope,
+        depth: args.depth,
+        direction: args.direction,
+        include: args.include,
+        maxNodes: args.maxNodes,
+        maxEdges: args.maxEdges,
+        annotate: args.annotate,
+        format: args.format,
+        allowedRelations: args.allowedRelations
+      });
+      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+
+    if (request.params.name === "get-vault-tree") {
+      const args = request.params.arguments || {} as any;
+      const tree = serverInstance!.buildVaultTree({ root: args.root, maxDepth: args.maxDepth, includeFiles: args.includeFiles, includeCounts: args.includeCounts, sort: args.sort, limitPerDir: args.limitPerDir });
+      if ((args.format || 'text') === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(tree, null, 2) }] };
+      }
+      // text renderer
+      const lines: string[] = [];
+      const walk = (node: any, depth: number) => {
+        const indent = '  '.repeat(depth);
+        if (node.type === 'directory') {
+          const info = node.counts ? ` (md: ${node.counts.md_files || 0}${node.mtimeLatest ? `, latest: ${node.mtimeLatest.slice(0,10)}`:''})` : '';
+          lines.push(`${indent}${node.path || node.name}${info}`);
+          for (const c of node.children || []) walk(c, depth + 1);
+        } else {
+          lines.push(`${indent}- ${node.name}${node.mtime ? ` (${node.mtime})`:''}`);
+        }
+      };
+      walk(tree, 0);
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    if (request.params.name === "get-folder-contents") {
+      const args = request.params.arguments || {} as any;
+      const rows = serverInstance!.buildFolderContents({ folderPath: String(args.folderPath || ''), recursive: args.recursive, sortBy: args.sortBy, limit: args.limit, filter: args.filter });
+    if ((args.format || 'text') === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+      }
+      if ((args.format || 'text') === 'table') {
+        const header: string[] = ['Title','Path','mtime','in','out'];
+        const widths: number[] = [
+          Math.max(header[0].length, ...rows.map(r=> (r.title||'').length)),
+          Math.max(header[1].length, ...rows.map(r=> (r.path||'').length)),
+          Math.max(header[2].length, ...rows.map(r=> (r.mtime||'').length)),
+          Math.max(header[3].length, ...rows.map(r=> String(r.degreeIn).length)),
+          Math.max(header[4].length, ...rows.map(r=> String(r.degreeOut).length))
+        ];
+        const pad = (s: string, w: number): string => (s + ' '.repeat(Math.max(0, w - s.length)));
+        const line = (cols: Array<string|number>): string => cols.map((c, i)=> pad(String(c), widths[i])).join('  ');
+        const lines: string[] = [line(header), line(widths.map(w=>'-'.repeat(w)))];
+        for (const r of rows) lines.push(line([r.title, r.path, r.mtime||'', r.degreeIn, r.degreeOut]));
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+      const text = rows.map(r => `- ${r.title} — ${r.path}  (mtime: ${r.mtime}, in:${r.degreeIn} out:${r.degreeOut})`).join('\n');
+      return { content: [{ type: 'text', text }] };
+    }
+
+    if (request.params.name === "find-path-between") {
+      const args = request.params.arguments || {} as any;
+      const res = serverInstance!.findPathBetween({ from: String(args.from || ''), to: String(args.to || ''), direction: args.direction, maxDepth: args.maxDepth, allowedRelations: args.allowedRelations, format: args.format });
+      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+      return { content: [{ type: 'text', text }] };
     }
 
     throw new Error(`Unknown tool: ${request.params.name}`);

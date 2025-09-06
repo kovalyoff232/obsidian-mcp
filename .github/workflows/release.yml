@@ -40,11 +40,29 @@ jobs:
           npm run bench | tee bench-report.json
           echo "Bench report saved to bench-report.json"
 
+      - name: Run graph smoke
+        run: |
+          npm run bench:graph | tee bench-graph.json
+          echo "Graph smoke saved to bench-graph.json"
+
+      - name: Run capture smoke
+        run: |
+          npm run bench:capture | tee bench-capture.json
+          echo "Capture smoke saved to bench-capture.json"
+
+      - name: Run semantic smoke
+        run: |
+          npm run bench:semantic | tee bench-semantic.json
+          echo "Semantic smoke saved to bench-semantic.json"
+
       - name: Calculate checksums
         run: |
           mkdir -p artifacts
           cp -r dist artifacts/dist
           cp bench-report.json artifacts/bench-report.json || true
+          cp bench-graph.json artifacts/bench-graph.json || true
+          cp bench-capture.json artifacts/bench-capture.json || true
+          cp bench-semantic.json artifacts/bench-semantic.json || true
           (cd artifacts && find dist -type f -print0 | xargs -0 -I{} sh -c 'sha256sum "{}" >> SHA256SUMS.txt')
           echo "Checksums:" && cat artifacts/SHA256SUMS.txt
 
@@ -77,6 +95,9 @@ jobs:
             artifacts/SHA256SUMS.txt
             artifacts/SHA256SUMS.txt.sig
             artifacts/bench-report.json
+            artifacts/bench-graph.json
+            artifacts/bench-capture.json
+            artifacts/bench-semantic.json
             artifacts/dist/mcp_server.js
             artifacts/dist/src/*.js
         env:

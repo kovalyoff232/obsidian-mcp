@@ -14,6 +14,22 @@
     "expectedPaths": [
       "graph/Dev Hub/Проекты/Obsidian MCP Plugin/Задачи/Полноценная морфология RU-EN/Полноценная морфология RU-EN.md"
     ]
+  },
+  {
+    "query": "Obsidian MCP Plugin",
+    "mode": "balanced",
+    "includeLinked": true,
+    "expectedPaths": [
+      "graph/Dev Hub/Проекты/Obsidian MCP Plugin/Obsidian MCP Plugin.md"
+    ]
+  },
+  {
+    "query": "Фичи",
+    "mode": "balanced",
+    "includeLinked": true,
+    "expectedPaths": [
+      "graph/Dev Hub/Проекты/Obsidian MCP Plugin/Фичи/Фичи.md"
+    ]
   }
 ]
 

@@ -38,7 +38,7 @@ Modern Obsidian plugin that indexes your vault and exposes powerful search and k
 - `bench/` — benchmark runner, config and dataset
 - `plugin_architecture.md` — detailed design notes
 
-## Installation (most users)
+## Installation
 
 1) Install dependencies and build
 

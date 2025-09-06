@@ -2,7 +2,7 @@
   "enforce": false,
   "min_cases": 2,
   "precision_at_10_min": 0.0,
-  "recall_at_10_min_min": 0.0,
+  "recall_at_10_min": 0.0,
   "mrr_at_10_min": 0.0,
   "latency_ms_p95_max": 2000
 }

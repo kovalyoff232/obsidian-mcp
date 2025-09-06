@@ -14,6 +14,9 @@
     "start:mcp": "node dist/mcp_server.js --transport stdio",
     "start:mcp-http": "node dist/mcp_server.js --transport http --port 3030",
     "bench": "node bench/run-bench.mjs",
+    "bench:graph": "node bench/run-graph-smoke.mjs",
+    "bench:capture": "node bench/run-capture-smoke.mjs",
+    "bench:semantic": "node bench/run-semantic-smoke.mjs",
     "version": "node version-bump.mjs && git add manifest.json versions.json"
   },
   "keywords": [
