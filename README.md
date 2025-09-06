@@ -88,6 +88,51 @@ npm run bench   # optional quality check
 # or via MCP: reindex-vault
 ```
 
+### Create the policy file
+
+The server does not generate the policy automatically. To enable the strict tree policy:
+
+1) Create `graph/.graph-policy.yml` with a template like below (start with `mode: warn` if you prefer a soft rollout, then switch to `block`):
+
+```yaml
+version: 1
+mode: block  # warn|block|off
+
+global:
+  frontmatter:
+    disallow_keys: [related, depends_on, blocks]
+  body:
+    wikilinks:
+      max_total: 1
+      only_to_parent: true
+    banned_headings: ["Связи", "Relations", "Связанное", "Related"]
+
+types:
+  feature:
+    required_keys: [title, type, part_of]
+    part_of:
+      required: true
+      exactly_one: true
+      parent:
+        title_in: ["Фичи"]
+  solution:
+    required_keys: [title, type, part_of]
+    part_of:
+      required: true
+      exactly_one: true
+      parent:
+        title_in: ["Решения"]
+
+enforcement:
+  tools: [write-note, append-under-heading, upsert-frontmatter, link-notes, unlink-notes, note-move, note-clone]
+```
+
+2) Reload:
+- Obsidian → Command Palette → “Restart MCP Server”; or
+- Reindex via MCP (`reindex-vault`) to refresh caches.
+
+3) Sanity check (optional): try to add a non-parent wikilink or a `related` key — in `block` mode the server should reject the mutation.
+
 ## Benchmarks
 
 ```bash
