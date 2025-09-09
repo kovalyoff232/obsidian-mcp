@@ -10,7 +10,7 @@ export class Indexer {
 
     constructor(plugin: MyPlugin, modelsPath: string) {
         this.plugin = plugin;
-        this.modelsPath = modelsPath; // Этот параметр больше не используется для воркера, но оставим для порядка
+        this.modelsPath = modelsPath; // Kept for consistency (not used by the worker anymore)
     }
 
     async startIndexing() {
@@ -22,7 +22,7 @@ export class Indexer {
     this.isIndexing = true;
     this.plugin.indexingView?.onIndexingStart();
 
-    // --- НАЧАЛО ФИНАЛЬНОГО ИСПРАВЛЕНИЯ ---
+    // --- BEGIN FINAL FIX ---
 
     const pluginRelativePath = this.plugin.manifest.dir;
 
@@ -33,13 +33,13 @@ export class Indexer {
         return;
     }
 
-    // `getResourcePath` как раз и ожидает путь относительно корня хранилища.
-    // `manifest.dir` именно его и предоставляет.
+    // `getResourcePath` expects a path relative to the vault root.
+    // `manifest.dir` provides exactly that.
     const pluginRootUrl = this.plugin.app.vault.adapter.getResourcePath(pluginRelativePath);
 
     this.plugin.indexingView?.addLog(`Plugin root URL for worker: ${pluginRootUrl}`);
 
-    // --- КОНЕЦ ФИНАЛЬНОГО ИСПРАВЛЕНИЯ ---
+    // --- END FINAL FIX ---
 
     this.worker = new Worker(this.plugin.workerUrl, { type: 'module' });
 
@@ -82,7 +82,7 @@ export class Indexer {
     });
 }
 
-    // ВОТ ЭТОТ МЕТОД БЫЛ ПОТЕРЯН. Я ЕГО ВЕРНУЛ.
+    // This method was missing previously. Restored.
     public stopIndexing() {
         if (this.worker) {
             this.worker.terminate();
