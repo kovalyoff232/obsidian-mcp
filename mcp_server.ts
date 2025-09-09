@@ -173,7 +173,26 @@ interface SearchResult {
 interface GraphPolicy {
   mode?: 'warn' | 'block';
   roots?: string[];
-  links?: { parentKey?: string; otherKeys?: string[]; relationsHeading?: string };
+  global?: {
+    frontmatter?: { disallow_keys?: string[] };
+    body?: { wikilinks?: { max_total?: number; only_to_parent?: boolean }, banned_headings?: string[] };
+  };
+  links?: {
+    parentKey?: string;
+    otherKeys?: string[];
+    relationsHeading?: string;
+    defaultRelation?: string;
+  };
+  folders?: {
+    canonicalPrefix?: string; // e.g. 'graph/Knowledge Hub/'
+    hubs?: { defaultPath?: string }; // e.g. 'graph/Knowledge Hub/Knowledge Hub.md'
+    index?: {
+      autoCreate?: boolean;
+      noteType?: string;        // type for auto-created index notes
+      summaryHeading?: string;  // default 'Summary'
+      relationsHeading?: string; // default fallback to links.relationsHeading
+    };
+  };
   types?: Record<string, {
     required?: string[];
     mustHaveParent?: boolean;
@@ -1729,24 +1748,33 @@ class ObsidianMCPServer {
 
   public loadGraphPolicy(): void {
     const root = path.resolve(this.vaultPath);
-    const candidate = path.join(root, 'graph', '.graph-policy.yml');
-    this.graphPolicyPath = candidate;
+    const candidateJson = path.join(root, 'graph', '_graph_policy.json');
+    const candidateYaml = path.join(root, 'graph', '.graph-policy.yml');
     let policy: GraphPolicy = this.policyDefaults();
+    let source = '[defaults]';
     try {
-      if (existsSync(candidate)) {
-        const txt = readFileSync(candidate, 'utf-8');
+      if (existsSync(candidateJson)) {
+        const txt = readFileSync(candidateJson, 'utf-8');
+        const obj = JSON.parse(txt);
+        if (obj && typeof obj === 'object') policy = { ...policy, ...obj };
+        try { this.graphPolicyMtime = statSync(candidateJson).mtimeMs; } catch {}
+        source = candidateJson;
+      } else if (existsSync(candidateYaml)) {
+        const txt = readFileSync(candidateYaml, 'utf-8');
         const obj = YAML.parse(txt) as any;
         if (obj && typeof obj === 'object') policy = { ...policy, ...obj };
-        try { this.graphPolicyMtime = statSync(candidate).mtimeMs; } catch {}
+        try { this.graphPolicyMtime = statSync(candidateYaml).mtimeMs; } catch {}
+        source = candidateYaml;
       }
     } catch (e) {
       console.error('⚠️ Failed to read graph policy, using defaults:', e);
     }
+    this.graphPolicyPath = source;
     this.graphPolicy = policy;
     this.policyMode = (policy.mode === 'block' ? 'block' : 'warn');
     this.parentKey = policy.links?.parentKey || 'part_of';
     this.relationsHeading = policy.links?.relationsHeading || 'Relations';
-    console.error(`🔒 Graph policy loaded (mode=${this.policyMode}) from ${existsSync(candidate) ? candidate : '[defaults]'}`);
+    console.error(`🔒 Graph policy loaded (mode=${this.policyMode}) from ${source}`);
   }
 
   private validateNoteAgainstPolicy(filePath: string, fm: Record<string, any>): string[] {
@@ -1850,7 +1878,8 @@ class ObsidianMCPServer {
     bidirectional?: boolean;
     heading?: string; // для body-режима
   }) {
-    const { fromPath, toPath, relation = 'related', mode = 'both', bidirectional = true, heading = 'Relations' } = options;
+    const defaultRel = this.graphPolicy.links?.defaultRelation || 'related';
+    const { fromPath, toPath, relation = defaultRel, mode = 'both', bidirectional = true, heading = this.relationsHeading || 'Relations' } = options;
 
     // Ссылка формата [[path]]
     const toWikilink = this.toWikiLink(toPath);
@@ -1988,7 +2017,8 @@ class ObsidianMCPServer {
       const fm = frontmatter || {};
       const reasons: string[] = [];
       const title = (fm.title || n.title || (n.path.split('/').pop() || '').replace(/\.md$/i, '')) as string;
-      const inCanon = n.path.startsWith('graph/Knowledge Hub/');
+      const canonPrefix = (this.graphPolicy.folders?.canonicalPrefix || 'graph/Knowledge Hub/');
+      const inCanon = n.path.startsWith(canonPrefix);
 
       // Базовые проблемы
       if (!fm || Object.keys(fm).length === 0) reasons.push('no-frontmatter');
@@ -1998,8 +2028,11 @@ class ObsidianMCPServer {
       // Для листьев (type != class) ожидаем связь/Relations (taxonomy НЕ обязательна)
       const isClass = String(fm.type || '').toLowerCase() === 'class';
       if (!isClass) {
-        const hasFmLink = Array.isArray(fm.part_of) ? fm.part_of.length > 0 : Boolean(fm.part_of);
-        const hasBodyLink = /(^|\n)##\s+Relations\b[\s\S]*?\[\[.+?\]\]/i.test(content);
+        const parentKey = this.parentKey || 'part_of';
+        const relHead = this.relationsHeading || 'Relations';
+        const hasFmLink = Array.isArray((fm as any)[parentKey]) ? (fm as any)[parentKey].length > 0 : Boolean((fm as any)[parentKey]);
+        const relHeadEsc = this.escapeRegex(relHead);
+        const hasBodyLink = new RegExp(`(^|\\n)##\\s+${relHeadEsc}\\b[\\s\\S]*?\\[\\[.+?\\]\\]`, 'i').test(content);
         if (!hasFmLink && !hasBodyLink) reasons.push('no-relations');
       }
 
@@ -2144,7 +2177,8 @@ class ObsidianMCPServer {
     bidirectional?: boolean;
     heading?: string;
   }) {
-    const { fromPath, toPath, relation = 'related', mode = 'both', bidirectional = true, heading = 'Relations' } = options;
+    const defaultRel = this.graphPolicy.links?.defaultRelation || 'related';
+    const { fromPath, toPath, relation = defaultRel, mode = 'both', bidirectional = true, heading = this.relationsHeading || 'Relations' } = options;
     const toWikilink = this.toWikiLink(toPath);
     const fromWikilink = this.toWikiLink(fromPath);
 
@@ -2364,7 +2398,7 @@ class ObsidianMCPServer {
 
   // ===== Graph repair and utilities =====
   private getCanonicalHubPath(): string {
-    return 'graph/Knowledge Hub/Knowledge Hub.md';
+    return this.graphPolicy.folders?.hubs?.defaultPath || 'graph/Knowledge Hub/Knowledge Hub.md';
   }
 
   private ensurePartOf(fromPath: string, toPath: string): void {
@@ -2374,9 +2408,9 @@ class ObsidianMCPServer {
     if (!existsSync(fromAbs)) return; // avoid resurrecting deleted files
     const toWikilink = this.toWikiLink(toPath);
     // frontmatter
-    this.upsertLinkInFrontmatter(fromPath, 'part_of', toWikilink);
+    this.upsertLinkInFrontmatter(fromPath, this.parentKey || 'part_of', toWikilink);
     // body
-    this.appendRelationBody(fromPath, 'Relations', toWikilink);
+    this.appendRelationBody(fromPath, this.relationsHeading || 'Relations', toWikilink);
   }
 
   private removeRelatedToHubIfNotHub(filePath: string): void {
@@ -2387,10 +2421,11 @@ class ObsidianMCPServer {
     const hub = this.getCanonicalHubPath().replace(/\.md$/i, '');
     const hubWiki = this.toWikiLink(hub);
     if (rel === this.getCanonicalHubPath()) return;
-    // remove from frontmatter related
-    this.removeLinkFromFrontmatter(rel, 'related', hubWiki);
-    // remove from body under Relations
-    this.removeRelationInBody(rel, 'Relations', hubWiki);
+    const defaultRel = this.graphPolicy.links?.defaultRelation || 'related';
+    // remove from frontmatter default relation key
+    this.removeLinkFromFrontmatter(rel, defaultRel, hubWiki);
+    // remove from body under relations heading
+    this.removeRelationInBody(rel, this.relationsHeading || 'Relations', hubWiki);
   }
 
   private parentIndexPathOf(notePath: string): string | null {
@@ -2427,8 +2462,11 @@ class ObsidianMCPServer {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     if (!existsSync(abs)) {
       const title = path.basename(indexPath, '.md');
-      const content = `## Summary\nИндекс‑заметка раздела «${title}».\n\n## Relations\n`;
-      const fm = { title, type: 'class' } as Record<string, any>;
+    const summaryHeading = this.graphPolicy.folders?.index?.summaryHeading || 'Summary';
+    const relHeading = this.graphPolicy.folders?.index?.relationsHeading || this.relationsHeading || 'Relations';
+    const content = `## ${summaryHeading}\nИндекс‑заметка раздела «${title}».\n\n## ${relHeading}\n`;
+    const fmType = this.graphPolicy.folders?.index?.noteType || 'class';
+    const fm = { title, type: fmType } as Record<string, any>;
       const md = this.buildMarkdownWithFrontmatter(fm, content);
       writeFileSync(abs, md, { encoding: 'utf-8' });
       try { this.scheduleIndexSingleFile(indexPath); } catch {}
@@ -2439,7 +2477,8 @@ class ObsidianMCPServer {
     let fixed = 0;
     const hub = this.getCanonicalHubPath();
     const vaultRoot = path.resolve(this.vaultPath);
-    const notes = this.indexData.map(n => n.path).filter(p => p.startsWith('graph/Knowledge Hub/') && p.endsWith('.md'));
+    const canonPrefix = (this.graphPolicy.folders?.canonicalPrefix || 'graph/Knowledge Hub/').replace(/^\/+|\/+$/g, '') + '/';
+    const notes = this.indexData.map(n => n.path).filter(p => p.startsWith(canonPrefix) && p.endsWith('.md'));
     for (const p of notes) {
       if (p === hub) continue;
       const abs = path.resolve(vaultRoot, p);
@@ -2664,7 +2703,10 @@ class ObsidianMCPServer {
     const relBase = `${folder.replace(/^\/+|\/+$/g,'')}/${safeName}.md`;
     const fmTags = Array.from(new Set([...(tags || []).map(t=>String(t)), 'autocaptured']));
     const fm: Record<string, any> = { title: safeName, type: 'note', tags: fmTags };
-    // prepare related wikilinks for frontmatter
+    // prepare wikilinks for optional frontmatter relation (if allowed by policy)
+    const relKey = this.graphPolicy.links?.defaultRelation || 'related';
+    const disallow = (this.graphPolicy.global?.frontmatter?.disallow_keys || []);
+    const canUseFmRelation = !disallow.includes(relKey);
     const relatedLinks: string[] = [];
     const addLink = (to: string) => {
       const rr = this.resolveNotePublic(to);
@@ -2680,7 +2722,7 @@ class ObsidianMCPServer {
       const wl = `[[${path.basename(hub,'.md')}]]`;
       if (!relatedLinks.includes(wl)) relatedLinks.push(wl);
     }
-    if (relatedLinks.length) fm['related'] = relatedLinks;
+    if (canUseFmRelation && relatedLinks.length) fm[relKey] = relatedLinks;
 
     const res = this.writeNote({ filePath: relBase, content, writeMode: 'create', frontmatter: fm, ensureMdExtension: true, createMissingFolders: true });
 
@@ -2689,15 +2731,15 @@ class ObsidianMCPServer {
       for (const h of hubs) {
         const rr = this.resolveNotePublic(h);
         const toPath = (rr && rr.exists && rr.path) ? rr.path : h;
-        this.appendRelationBody(res.relativePath, 'Relations', this.toWikiLink(toPath));
+        this.appendRelationBody(res.relativePath, this.relationsHeading || 'Relations', this.toWikiLink(toPath));
       }
     } else if (linkToHub) {
-      this.appendRelationBody(res.relativePath, 'Relations', this.toWikiLink(this.getCanonicalHubPath()));
+      this.appendRelationBody(res.relativePath, this.relationsHeading || 'Relations', this.toWikiLink(this.getCanonicalHubPath()));
     }
     for (const r of relations) {
       const rr = this.resolveNotePublic(r);
       const toPath = (rr && rr.exists && rr.path) ? rr.path : r;
-      this.appendRelationBody(res.relativePath, 'Relations', this.toWikiLink(toPath));
+      this.appendRelationBody(res.relativePath, this.relationsHeading || 'Relations', this.toWikiLink(toPath));
     }
 
     return { path: res.relativePath };
