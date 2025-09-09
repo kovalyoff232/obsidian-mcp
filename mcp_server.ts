@@ -2030,12 +2030,12 @@ class ObsidianMCPServer {
   }
 
   // Нормализация фронтматтера: baseline + заголовок + тип + теги
-  public normalizeNoteBaseline(options: { filePath: string; dryRun?: boolean }): {
+  public normalizeNoteBaseline(options: { filePath: string; dryRun?: boolean; forceParent?: boolean }): {
     path: string;
     updatedKeys: string[];
     guessed: { title?: string; type?: string; aliases?: string[]; tags?: string[]; taxonomy?: string[] };
   } {
-    const { filePath, dryRun = false } = options;
+    const { filePath, dryRun = false, forceParent = false } = options;
     const vaultRoot = path.resolve(this.vaultPath);
     let relWithExt = filePath.toLowerCase().endsWith('.md') ? filePath : `${filePath}.md`;
     // Попытка прямого доступа
@@ -2094,6 +2094,33 @@ class ObsidianMCPServer {
       aliases,
       taxonomy
     };
+
+    // Auto-add parent link (part_of) when missing, inferred from folder hierarchy
+    try {
+      const parentKey = this.parentKey || 'part_of';
+      const hasParent = Array.isArray((updated as any)[parentKey])
+        ? ((updated as any)[parentKey] as any[]).length > 0
+        : Boolean((updated as any)[parentKey]);
+
+      // Expected parent is the index note of the current folder (folder/folder.md)
+      const expectedParent = this.selfFolderIndexPathOf(relWithExt);
+      const invalidExpected = expectedParent && /^graph\/graph\.md$/i.test(expectedParent);
+
+      const setParent = (p: string) => {
+        try { this.ensureIndexNoteExists(p); } catch {}
+        (updated as any)[parentKey] = this.toWikiLink(p);
+      };
+
+      if (!invalidExpected && expectedParent && expectedParent !== relWithExt) {
+        if (!hasParent) {
+          setParent(expectedParent);
+        } else if (forceParent) {
+          setParent(expectedParent);
+        }
+      }
+    } catch (e) {
+      console.error('⚠️ normalize-baseline: failed to infer part_of:', e);
+    }
 
     const updatedKeys = Object.keys(updated).filter(k => currentFm[k] !== updated[k]);
     if (!dryRun) {
@@ -2381,6 +2408,18 @@ class ObsidianMCPServer {
     return parentPath;
   }
 
+  // Returns index note path inside the current folder (e.g., graph/X/Y/Z.md -> graph/X/Y/Y.md)
+  private selfFolderIndexPathOf(notePath: string): string | null {
+    const parts = notePath.replace(/\\/g, '/').split('/');
+    if (parts.length < 2) return null;
+    // remove filename
+    parts.pop();
+    if (parts.length === 0) return null;
+    const folder = parts[parts.length - 1];
+    const indexPath = [...parts, `${folder}.md`].join('/');
+    return indexPath;
+  }
+
   private ensureIndexNoteExists(indexPath: string): void {
     const vaultRoot = path.resolve(this.vaultPath);
     const abs = path.resolve(vaultRoot, indexPath);
@@ -2423,6 +2462,87 @@ class ObsidianMCPServer {
       }
     }
     return { fixed };
+  }
+
+  // Purge subtree by path prefix — fast batch deletion using indexData
+  public purgeSubtree(options: { pathPrefix: string; deleteNonMd?: boolean; dryRun?: boolean }): { removedFiles: number; removedDirs: number; listedFiles?: string[]; listedDirs?: string[] } {
+    const { pathPrefix, deleteNonMd = false, dryRun = false } = options;
+    const vaultRoot = path.resolve(this.vaultPath);
+    const normPrefix = pathPrefix.replace(/^\/+|\/+$/g, '') + '/';
+    const absPrefix = path.resolve(vaultRoot, normPrefix);
+    if (!absPrefix.startsWith(vaultRoot)) throw new Error('Path escapes vault root');
+    if (!existsSync(absPrefix)) {
+      return { removedFiles: 0, removedDirs: 0, listedFiles: [], listedDirs: [] };
+    }
+
+    // Files by index (md only)
+    const mdFiles = this.indexData
+      .map(n => n.path)
+      .filter(p => p.startsWith(normPrefix) && p.toLowerCase().endsWith('.md'))
+      .sort((a, b) => b.split('/').length - a.split('/').length);
+
+    // Walk filesystem to include non-md and any md not in index
+    const filesFs: string[] = [];
+    const dirsFs: string[] = [];
+    const walk = (dirAbs: string) => {
+      const entries = readdirSync(dirAbs);
+      for (const entry of entries) {
+        const full = path.join(dirAbs, entry);
+        const st = statSync(full);
+        if (st.isDirectory()) {
+          dirsFs.push(full);
+          walk(full);
+        } else if (st.isFile()) {
+          const rel = path.relative(vaultRoot, full).replace(/\\/g, '/');
+          if (entry.toLowerCase().endsWith('.md')) filesFs.push(rel);
+          else if (deleteNonMd) filesFs.push(rel);
+        }
+      }
+    };
+    walk(absPrefix);
+
+    // Merge and dedupe files (md from index first to ensure ordering)
+    const allFiles = Array.from(new Set([...mdFiles, ...filesFs]));
+
+    // Directories in deepest-first order
+    const allDirs = Array.from(new Set(dirsFs
+      .map(d => path.relative(vaultRoot, d).replace(/\\/g, '/'))
+      .sort((a, b) => b.split('/').length - a.split('/').length)));
+
+    if (dryRun) {
+      return { removedFiles: 0, removedDirs: 0, listedFiles: allFiles, listedDirs: allDirs };
+    }
+
+    // Delete files
+    let removedFiles = 0;
+    for (const rel of allFiles) {
+      try {
+        const abs = path.resolve(vaultRoot, rel);
+        if (existsSync(abs)) { rmSync(abs); removedFiles++; }
+      } catch {}
+    }
+
+    // Remove from in-memory index
+    if (removedFiles > 0) {
+      const toRemoveSet = new Set(allFiles.filter(p => p.toLowerCase().endsWith('.md')));
+      this.indexData = this.indexData.filter(n => !toRemoveSet.has(n.path));
+    }
+
+    // Delete directories (only when empty)
+    let removedDirs = 0;
+    for (const relDir of allDirs) {
+      try {
+        const absDir = path.resolve(vaultRoot, relDir);
+        const entries = readdirSync(absDir);
+        if (entries.length === 0) { rmSync(absDir, { recursive: false }); removedDirs++; }
+      } catch {}
+    }
+
+    // Invalidate caches and backlinks
+    this.rebuildBacklinkIndex();
+    this.bumpRevisionAndInvalidate();
+
+    return { removedFiles, removedDirs };
   }
 
   // ===== Simple template engine =====
@@ -3469,534 +3589,174 @@ export function createServer() {
         return {
       tools: [
         {
-          name: "capture-note",
-          description: `📝 Быстро создать заметку в inbox с фронтматтером и автолинком к Knowledge Hub.\n\nПараметры: name, content, tags[], relations[], folder (default: inbox), linkToHub (default: true), hubs[] (доп. хабы).`,
+          name: "search",
+          description: `🔎 Поиск по заметкам Obsidian (fuse|semantic|auto). Поддерживает фильтры и формат вывода.`,
           inputSchema: {
             type: "object",
             properties: {
-              name: { type: "string" },
-              content: { type: "string" },
-              tags: { type: "array", items: { type: "string" } },
-              relations: { type: "array", items: { type: "string" } },
-              folder: { type: "string", default: "inbox" },
-              linkToHub: { type: "boolean", default: true },
-              hubs: { type: "array", items: { type: "string" }, description: "Автолинк к указанным хабам (title|path). Если задан — linkToHub игнорируется." }
-            },
-            required: ["name","content"]
-          }
-        },
-        {
-          name: "daily-journal-append",
-          description: `🗒️ Ежедневная запись: дописать в файл за YYYY-MM-DD под заданным заголовком (по умолчанию Inbox), с bullet+timestamp по умолчанию.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              content: { type: "string" },
-              heading: { type: "string", default: "Inbox" },
-              bullet: { type: "boolean", default: true },
-              timestamp: { type: "boolean", default: true },
-              filePath: { type: "string", description: "Переопределить путь файла (по умолчанию inbox/YYYY-MM-DD.md)" },
-              date: { type: "string", description: "YYYY-MM-DD" }
-            },
-            required: ["content"]
-          }
-        },
-        {
-          name: "search-notes",
-          description: `🔍 ИДЕАЛЬНЫЙ ПОИСК по заметкам Obsidian, оптимизированный для LLM-агентов.
-
-Назначение: находить заметки по смыслу, поддерживать расширенные операторы и возвращать читаемый список.
-
-🎯 HIGHLIGHTING — найденные слова подсвечиваются жирным **текстом**
-🔗 Связанные заметки — автоматическое расширение хороших результатов  
-🔍 Расширенные операторы:
-  • "точная фраза" — поиск точного совпадения
-  • +обязательное — слово должно присутствовать
-  • -исключить — слово не должно встречаться
-  • title:заголовок, path:путь, tags:тег, content:содержимое
-
-Категоризация: результаты помечаются типами (📚 Документация, 📋 ТЗ, 💻 Код, 🎓 Обучение, ✅ TODO и др.)
-
-Кэш: мгновенные повторные запросы. Fuzzy-поиск устойчив к опечаткам. Ведётся аналитика.
-
-Советы для агента:
-- Комбинируй запросы с полями (title/path/tags) для точности.
-- Если используешь только поля — добавь одно-два общих термина.
-- Начинай с общего запроса и при необходимости уточняй.
-
-Примеры:
-- javascript код
-- "техническое задание" +gambit -старый  
-- title:readme path:docs
-- функция массив база
-
-Поиск работает на русском и английском; доступны синонимы.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              libraryName: {
-                type: "string",
-                description: "Поисковый запрос для поиска в заметках Obsidian. Поддерживает расширенные операторы: \"точная фраза\", +обязательное, -исключить, field:value"
-              }
-            },
-            required: ["libraryName"]
-          }
-        },
-        {
-          name: "find-uncategorized-notes",
-          description: `🧹 Найти заметки без базовой категоризации (нет фронтматтера/title/type/taxonomy/relations или вне канон-папок).`,
-          inputSchema: {
-            type: "object",
-            properties: { limit: { type: "number", description: "Максимум результатов", default: 20 } }
-          }
-        },
-        {
-          name: "normalize-note-baseline",
-          description: `🧰 Привести заметку к базовому шаблону (frontmatter: title/type/tags/aliases/taxonomy). Не создаёт связи.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              filePath: { type: "string", description: "Путь к заметке" },
-              dryRun: { type: "boolean", description: "Только показать, что будет изменено", default: false }
-            },
-            required: ["filePath"]
-          }
-        },
-        {
-          name: "get-note-content",
-          description: `📄 Получить ПОЛНОЕ СОДЕРЖИМОЕ заметки по её ID, пути или заголовку.
-
-Назначение: когда нужен полный контент или извлечение секций по теме.
-
-Советы для агента:
-- context7CompatibleLibraryID — это ID/путь/заголовок из search-notes.
-- tokens ограничивает примерный размер (≈4 символа = 1 токен).
-- topic добавит релевантные секции в начало ответа.`,
-          inputSchema: {
-            type: "object", 
-            properties: {
-              context7CompatibleLibraryID: {
-                type: "string",
-                description: "ID заметки, путь к файлу или заголовок заметки для получения полного содержимого"
-              },
-              tokens: {
-                type: "number",
-                description: "Максимальное количество токенов содержимого для возврата (опционально, по умолчанию полное содержимое)"
-              },
-              topic: {
-                type: "string", 
-                description: "Опциональная тема для фокусировки на определенной части содержимого заметки"
-              }
-            },
-            required: ["context7CompatibleLibraryID"]
-          }
-        },
-        {
-          name: "write-note",
-          description: `✍️ Создать/перезаписать/дописать заметку (LLM-safe API).
-
-Режимы:
-- create — создать (ошибка, если файл существует)
-- overwrite — перезаписать целиком (передавай итоговый текст)
-- append — дописать в конец или под heading
-
-Frontmatter: можно передать объект ключ-значение (Yaml/JSON сериализуется автоматически).
-
-Рекомендации:
-- Для append укажи heading, чтобы структурировать добавления.
-- Для overwrite присылай полный финальный текст.
-
-Примеры путей: "inbox/today" или "документация/new-note.md"` ,
-          inputSchema: {
-            type: "object",
-            properties: {
-              filePath: {
-                type: "string",
-                description: "Относительный путь в vault (с .md или без)"
-              },
-              content: {
-                type: "string",
-                description: "Markdown-содержимое для записи"
-              },
-              writeMode: {
-                type: "string",
-                enum: ["create", "overwrite", "append"],
-                description: "Режим записи"
-              },
-              heading: {
-                type: "string",
-                description: "Если указан, при append допишет под этим заголовком (создаст при отсутствии)"
-              },
-              frontmatter: {
-                type: "object",
-                description: "Опциональный YAML frontmatter (ключ-значение)"
-              },
-              ensureMdExtension: {
-                type: "boolean",
-                description: "Добавить .md, если отсутствует",
-                default: true
-              },
-              createMissingFolders: {
-                type: "boolean",
-                description: "Создавать недостающие папки",
-                default: true
-              }
-            },
-            required: ["filePath", "content"]
-          }
-        },
-        {
-          name: "append-under-heading",
-          description: `➕ Точное дописывание под указанным заголовком.
-
-Опции:
-- Автосоздание заголовка, если он отсутствует
-- Автопрефикс времени (ISO)
-- Буллеты для списков
-
-Советы:
-- Для логов задач ставь bullet=true и timestamp=true.
-- Пиши атомарные короткие записи.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              filePath: { type: "string", description: "Путь к заметке (относительно vault)" },
-              heading: { type: "string", description: "Заголовок, под которым нужно дописать" },
-              content: { type: "string", description: "Текст для дописывания" },
-              bullet: { type: "boolean", description: "Добавить '-' перед строкой", default: false },
-              timestamp: { type: "boolean", description: "Добавить ISO-время перед строкой", default: false },
-              ensureMdExtension: { type: "boolean", default: true },
-              createMissingFolders: { type: "boolean", default: true }
-            },
-            required: ["filePath", "heading", "content"]
-          }
-        },
-        {
-          name: "create-node",
-          description: `📦 Создать «ноду» — заметку с frontmatter (title, type, properties) и контентом.
-
-Назначение: формирование вершин графа знаний. Свойства читаются Dataview/Graph.
-Рекомендации: задавай говорящие title/type. В properties можно передавать массивы и объекты.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              filePath: { type: "string", description: "Путь для новой заметки" },
-              title: { type: "string", description: "Заголовок (frontmatter.title)" },
-              type: { type: "string", description: "Тип ноды (frontmatter.type)" },
-              properties: { type: "object", description: "Доп. свойства фронтматтера" },
-              content: { type: "string", description: "Начальный контент" },
-              ensureMdExtension: { type: "boolean", default: true },
-              createMissingFolders: { type: "boolean", default: true }
-            },
-            required: ["filePath"]
-          }
-        },
-        {
-          name: "link-notes",
-          description: `🔗 Связать две заметки (A→B), с опцией двунаправленной связи.
-
-Режимы:
-- property — добавить wikilink в список frontmatter (relation, по умолчанию related)
-- body — дописать wikilink под заголовком (heading, по умолчанию Relations)
-- both — записать и туда, и туда
-
-Лучшие практики:
-- Для зависимостей используй relation="depends_on".
-- Для навигации — relation="related".
-- bidirectional=true обычно полезно`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              fromPath: { type: "string", description: "Относительный путь A" },
-              toPath: { type: "string", description: "Относительный путь B" },
-              relation: { type: "string", description: "Имя свойства-списка ссылок", default: "related" },
-              mode: { type: "string", enum: ["property", "body", "both"], default: "both" },
-              bidirectional: { type: "boolean", default: true },
-              heading: { type: "string", description: "Заголовок для body-режима", default: "Relations" }
-            },
-            required: ["fromPath", "toPath"]
-          }
-        },
-        {
-          name: "upsert-frontmatter",
-          description: `🧩 Безопасно обновить фронтматтер: set/remove ключи.
-
-Советы: ссылки передавай как wikilink-строки "[[Note]]" или списки таких строк.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              filePath: { type: "string", description: "Путь к заметке" },
-              set: { type: "object", description: "Ключи/значения для установки" },
-              removeKeys: { type: "array", items: { type: "string" }, description: "Ключи для удаления" },
-              ensureMdExtension: { type: "boolean", default: true },
-              createMissingFolders: { type: "boolean", default: true }
-            },
-            required: ["filePath"]
-          }
-        },
-        {
-          name: "unlink-notes",
-          description: `🗑️ Удалить связь между двумя заметками. Работает симметрично при bidirectional=true.
-
-Режимы: property | body | both. Для body укажи heading, если секций несколько.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              fromPath: { type: "string", description: "Путь A" },
-              toPath: { type: "string", description: "Путь B" },
-              relation: { type: "string", description: "Имя свойства (для property)", default: "related" },
-              mode: { type: "string", enum: ["property", "body", "both"], default: "both" },
-              bidirectional: { type: "boolean", default: true },
-              heading: { type: "string", description: "Заголовок для body", default: "Relations" }
-            },
-            required: ["fromPath", "toPath"]
-          }
-        },
-        {
-          name: "repair-graph",
-          description: `🧹 Привести граф в порядок по правилу «ёлки».
-
-Действия:
-- Удаляет прямые связи листьев с Knowledge Hub
-- Гарантирует цепочки part_of по иерархии папок (child → parent)
-- Автосоздаёт индекс‑заметки классов при отсутствии
-Возвращает количество исправленных связей/узлов.`,
-          inputSchema: { type: "object", properties: {}, additionalProperties: false }
-        },
-        {
-          name: "apply-template",
-          description: `🧩 Применить простой шаблон {{var}} к содержимому и (опционально) записать в файл.
-
-Переменные: передаются объектом variables; доступны {{date}} и {{datetime}}.
-Если передан filePath — результат будет записан указанным режимом.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              template: { type: "string", description: "Текст шаблона с плейсхолдерами {{var}}" },
-              variables: { type: "object", description: "Объект переменных" },
-              filePath: { type: "string", description: "Куда записать результат (опционально)" },
-              writeMode: { type: "string", enum: ["create","overwrite","append"] },
-              heading: { type: "string", description: "Заголовок для append" }
-            },
-            required: ["template"]
-          }
-        },
-        {
-          name: "get-graph-policy",
-          description: `📜 Показать текущую политику графа (режимы, типы, ключи).`,
-          inputSchema: { type: "object", properties: {}, additionalProperties: false }
-        },
-        {
-          name: "reload-graph-policy",
-          description: `🔁 Перезагрузить graph/.graph-policy.yml и обновить параметры валидации.`,
-          inputSchema: { type: "object", properties: {}, additionalProperties: false }
-        },
-        {
-          name: "validate-graph",
-          description: `✅ Прогнать валидацию по vault: проверка required/type/parent. Возвращает отчет.`,
-          inputSchema: { type: "object", properties: { pathPrefix: { type: 'string' } }, additionalProperties: false }
-        },
-        {
-          name: "bulk-autolink",
-          description: `🔗 Массовая автолинковка: заменить в тексте упоминания на [[Note]].
-
-Параметры: mappings[{term,toPath}], maxPerFile, limitFiles.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              mappings: { type: "array", items: { type: "object", properties: { term: { type: "string" }, toPath: { type: "string" } }, required: ["term","toPath"] } },
-              maxPerFile: { type: "number", default: 3 },
-              limitFiles: { type: "number", default: 50 }
-            },
-            required: ["mappings"]
-          }
-        },
-        {
-          name: "note-move",
-          description: `📦 Переместить заметку в новое место (с созданием папок).`,
-          inputSchema: { type: "object", properties: { fromPath: { type: "string" }, toPath: { type: "string" }, overwrite: { type: "boolean" } }, required: ["fromPath","toPath"] }
-        },
-        {
-          name: "note-clone",
-          description: `📄 Клонировать заметку в новый путь (опц. сменить title).`,
-          inputSchema: { type: "object", properties: { fromPath: { type: "string" }, toPath: { type: "string" }, setTitle: { type: "string" } }, required: ["fromPath","toPath"] }
-        },
-        {
-          name: "note-delete",
-          description: `🗑️ Удалить заметку по пути (осторожно, безвозвратно).`,
-          inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
-        },
-        {
-          name: "reindex-vault",
-          description: `🔄 Проиндексировать все заметки во vault и обновить поисковый индекс (Fuse.js).
-
-Используй после массовых изменений/создания заметок. Возвращает количество заново проиндексированных заметок.`,
-          inputSchema: {
-            type: "object",
-            properties: {},
-            additionalProperties: false
-          }
-        },
-        {
-          name: "get-graph-summary",
-          description: `📊 Получить сводку графа по заметке: исходящие/входящие связи, с глубиной.
-
-Параметры: noteId, depth (1..3), direction (in|out|both), relation(optional для фильтрации).`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              noteId: { type: "string", description: "ID/путь/заголовок заметки" },
-              depth: { type: "number", description: "Глубина обхода", default: 1 },
-              direction: { type: "string", enum: ["in", "out", "both"], default: "both" },
-              relation: { type: "string", description: "Имя свойства для фильтрации (optional)" }
-            },
-            required: ["noteId"]
-          }
-        },
-        {
-          name: "find-unlinked-mentions",
-          description: `🧠 Найти нелинкованные упоминания терминов и предложить автолинки.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              terms: { type: "array", items: { type: "string" }, description: "Список терминов/названий" },
-              maxPerFile: { type: "number", default: 3 },
-              limitFiles: { type: "number", default: 30 }
-            },
-            required: ["terms"]
-          }
-        },
-        {
-          name: "reindex-changed-since",
-          description: `⏱️ Переиндексировать только изменённые со времени timestamp (ISO).`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              since: { type: "string", description: "ISO-время" }
-            },
-            required: ["since"]
-          }
-        },
-        {
-          name: "embed-and-upsert",
-          description: `🧠 СЕМАНТИКА: создать/обновить эмбеддинг заметки (каркас).\n\nЕсли семантика отключена, вернёт noop-ответ.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              noteId: { type: "string", description: "ID/путь/заголовок заметки" },
-              mode: { type: "string", enum: ["note","chunks"], default: "note" }
-            },
-            required: ["noteId"]
-          }
-        },
-        {
-          name: "semantic-query",
-          description: `🧠 СЕМАНТИКА: поиск по эмбеддингам (каркас).\n\nЕсли семантика отключена — мягкий фолбэк к обычному поиску.`,
-          inputSchema: {
-            type: "object",
-            properties: {
-              query: { type: "string" },
-              topK: { type: "number", default: 5 },
+              query: { type: "string", description: "Строка запроса (поддерживаются расширенные операторы для fuse)" },
+              engine: { type: "string", enum: ["fuse","semantic","auto"], default: "auto" },
+              limit: { type: "number", default: 20 },
               offset: { type: "number", default: 0 },
-              filters: { type: "object", properties: { pathPrefix: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } }, type: { type: "string" } } }
+              includeLinked: { type: "boolean", default: true },
+              filters: { type: "object", properties: { pathPrefix: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } }, type: { type: "string" } } },
+              format: { type: "string", enum: ["text","json"], default: "text" }
             },
             required: ["query"]
           }
         },
-        {
-          name: "semantic-build-index",
-          description: `🧠 СЕМАНТИКА: предрасчёт эмбеддингов для всех заметок (каркас).`,
-          inputSchema: {
-            type: "object",
-            properties: { limit: { type: "number", description: "Ограничить кол-во" } }
-          }
-        },
-        {
-          name: "resolve-note",
-          description: `🔎 Канонизация идентификатора заметки: title|alias|path → {path,id,title,aliases,exists,suggestions}`,
-          inputSchema: {
-            type: "object",
-            properties: { input: { type: "string", description: "Заголовок/алиас/путь" } },
-            required: ["input"]
-          }
-        },
-        {
-          name: "get-relations-of-note",
-          description: `🕸️ Извлечь связи заметки: тела (wikilinks) и frontmatter-списки` ,
+{
+          name: "notes",
+          description: `📝 Унифицированные операции с заметками: write | append-under | journal | template | create-node | capture | frontmatter | link | unlink | move | clone | delete | autolink | find-unlinked-mentions`,
           inputSchema: {
             type: "object",
             properties: {
+              operation: { type: "string", enum: ["write","append-under","journal","template","create-node","capture","frontmatter","link","unlink","move","clone","delete","autolink","find-unlinked-mentions"], default: "write" },
+              // common/write
+              filePath: { type: "string", description: "Путь заметки" },
+              content: { type: "string", description: "Markdown-контент" },
+              writeMode: { type: "string", enum: ["create","overwrite","append"], default: "create" },
+              heading: { type: "string" },
+              frontmatter: { type: "object" },
+              ensureMdExtension: { type: "boolean", default: true },
+              createMissingFolders: { type: "boolean", default: true },
+              // append-under / journal
+              bullet: { type: "boolean", default: false },
+              timestamp: { type: "boolean", default: false },
+              date: { type: "string", description: "YYYY-MM-DD (journal)" },
+              // template
+              template: { type: "string" },
+              variables: { type: "object" },
+              // create-node
+              title: { type: "string" },
+              type: { type: "string" },
+              properties: { type: "object" },
+              // capture
+              name: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              relations: { type: "array", items: { type: "string" } },
+              folder: { type: "string", default: "inbox" },
+              linkToHub: { type: "boolean", default: true },
+              hubs: { type: "array", items: { type: "string" } },
+              // link/unlink
+              fromPath: { type: "string" },
+              toPath: { type: "string" },
+              relation: { type: "string", default: "related" },
+              mode: { type: "string", enum: ["property","body","both"], default: "both" },
+              bidirectional: { type: "boolean", default: true },
+              // move/clone/delete
+              overwrite: { type: "boolean" },
+              setTitle: { type: "string" },
+              path: { type: "string" },
+              // autolink
+              mappings: { type: "array", items: { type: "object", properties: { term: { type: "string" }, toPath: { type: "string" } }, required: ["term","toPath"] } },
+              maxPerFile: { type: "number", default: 3 },
+              limitFiles: { type: "number", default: 50 },
+              // find-unlinked-mentions
+              terms: { type: "array", items: { type: "string" } }
+            },
+            required: ["operation"]
+          }
+        },
+        {
+          name: "vault",
+          description: `🗂️ Vault: resolve | browse | content`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              operation: { type: "string", enum: ["resolve","browse","content"], default: "resolve" },
+              // resolve
+              input: { type: "string", description: "Заголовок/алиас/путь (resolve)" },
+              // browse (tree/list)
+              mode: { type: "string", enum: ["tree","list"], default: "tree" },
+              root: { type: "string" },
+              maxDepth: { type: "number", default: 3 },
+              includeFiles: { type: "boolean", default: false },
+              includeCounts: { type: "boolean", default: true },
+              sort: { type: "string", enum: ["name","mtime","count"], default: "name" },
+              limitPerDir: { type: "number", default: 50 },
+              folderPath: { type: "string" },
+              recursive: { type: "boolean", default: false },
+              sortBy: { type: "string", enum: ["name","mtime","degreeIn","degreeOut"], default: "mtime" },
+              limit: { type: "number", default: 200 },
+              filter: { type: "object", properties: { ext: { type: "array", items: { type: "string" } }, type: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } } } },
+              format: { type: "string", enum: ["text","json","table"], default: "text" },
+              // content
+              context7CompatibleLibraryID: { type: "string" },
+              tokens: { type: "number" },
+              topic: { type: "string" }
+            },
+            required: ["operation"]
+          }
+        },
+        {
+          name: "graph",
+          description: `🧭 Граф: query (relations|summary|neighborhood|snapshot|policy|path) и maintenance (repair|validate|reload-policy|normalize-baseline|find-uncategorized)`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              // maintenance
+              action: { type: "string", enum: ["repair","validate","reload-policy","normalize-baseline","find-uncategorized"], description: "Если указан action — будет maintenance-режим", default: "" },
+              pathPrefix: { type: "string" },
+              filePath: { type: "string" },
+              dryRun: { type: "boolean", default: false },
+              limit: { type: "number", default: 20 },
+              // query
+              view: { type: "string", enum: ["relations","summary","neighborhood","snapshot","policy","path","auto"], description: "Если указан view — будет query-режим" },
               noteId: { type: "string" },
-              include: { type: "object", properties: { bodyLinks: { type: "boolean" }, frontmatterLists: { anyOf: [ { type: "array", items: { type: "string" } }, { const: "*" } ] } } }
-            },
-            required: ["noteId"]
-          }
-        },
-        {
-          name: "get-note-neighborhood",
-          description: `👥 Окрестность узла по слоям L1..Lk (входящие/исходящие)` ,
-          inputSchema: {
-            type: "object",
-            properties: {
-              noteId: { type: "string" }, depth: { type: "number", default: 2 }, fanoutLimit: { type: "number", default: 30 }, direction: { type: "string", enum: ["in","out","both"], default: "both" }, format: { type: "string", enum: ["text","json"], default: "text" }
-            },
-            required: ["noteId"]
-          }
-        },
-        {
-          name: "get-graph-snapshot",
-          description: `🧭 Снимок подграфа (ego-граф от noteId или поддерево по folderPrefix)` ,
-          inputSchema: {
-            type: "object",
-            properties: {
               scope: { type: "object", properties: { startNoteId: { type: "string" }, folderPrefix: { type: "string" } } },
-              depth: { type: "number", default: 2 }, direction: { type: "string", enum: ["in","out","both"], default: "both" }, include: { type: "object", properties: { bodyLinks: { type: "boolean" }, fmLinks: { type: "boolean" } } }, maxNodes: { type: "number", default: 300 }, maxEdges: { type: "number", default: 1000 }, annotate: { type: "boolean", default: true }, format: { type: "string", enum: ["json","mermaid","dot","text"], default: "json" }, allowedRelations: { type: "array", items: { type: "string" } }, nodeFilter: { type: "object", properties: { pathPrefix: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } } } }
-            }
+              direction: { type: "string", enum: ["in","out","both"], default: "both" },
+              depth: { type: "number", default: 1 },
+              include: { type: "object", properties: { bodyLinks: { type: "boolean" }, fmLinks: { type: "boolean" }, frontmatterLists: { anyOf: [ { type: "array", items: { type: "string" } }, { const: "*" } ] } } },
+              relation: { type: "string" },
+              allowedRelations: { type: "array", items: { type: "string" } },
+              nodeFilter: { type: "object", properties: { pathPrefix: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } } } },
+              fanoutLimit: { type: "number", default: 30 },
+              maxNodes: { type: "number", default: 300 },
+              maxEdges: { type: "number", default: 1000 },
+              annotate: { type: "boolean", default: true },
+              format: { type: "string", enum: ["text","json","mermaid","dot"], default: "json" },
+              from: { type: "string" },
+              to: { type: "string" },
+              maxDepth: { type: "number", default: 5 }
+            },
+            required: []
           }
         },
         {
-          name: "get-vault-tree",
-          description: `🌲 Дерево папок с агрегатами (counts, latest mtime)` ,
+          name: "index",
+          description: `🛠️ Индексация и семантика: reindex-full | reindex-since | embed-one | embed-build`,
           inputSchema: {
             type: "object",
-            properties: { root: { type: "string" }, maxDepth: { type: "number", default: 3 }, includeFiles: { type: "boolean", default: false }, includeCounts: { type: "boolean", default: true }, sort: { type: "string", enum: ["name","mtime","count"], default: "name" }, limitPerDir: { type: "number", default: 50 }, format: { type: "string", enum: ["text","json"], default: "text" } }
+            properties: {
+              action: { type: "string", enum: ["reindex-full","reindex-since","embed-one","embed-build"], default: "reindex-full" },
+              since: { type: "string", description: "ISO-время (для reindex-since)" },
+              noteId: { type: "string", description: "ID/путь (для embed-one)" },
+              mode: { type: "string", enum: ["note","chunks"], description: "Режим эмбеддинга (для embed-one)", default: "note" },
+              limit: { type: "number", description: "Лимит (для embed-build)" }
+            },
+            required: ["action"]
           }
         },
-        {
-          name: "get-folder-contents",
-          description: `📁 Содержимое папки с сортировкой и фильтрами` ,
-          inputSchema: {
-            type: "object",
-            properties: { folderPath: { type: "string" }, recursive: { type: "boolean", default: false }, sortBy: { type: "string", enum: ["name","mtime","degreeIn","degreeOut"], default: "mtime" }, limit: { type: "number", default: 200 }, filter: { type: "object", properties: { ext: { type: "array", items: { type: "string" } }, type: { type: "string" }, tagIncludes: { type: "array", items: { type: "string" } } } }, format: { type: "string", enum: ["text","json","table"], default: "text" } },
-            required: ["folderPath"]
-          }
-        },
-        {
-          name: "find-path-between",
-          description: `🧵 Кратчайший путь между двумя заметками (BFS)` ,
-          inputSchema: {
-            type: "object",
-            properties: { from: { type: "string" }, to: { type: "string" }, direction: { type: "string", enum: ["in","out","both"], default: "both" }, maxDepth: { type: "number", default: 5 }, allowedRelations: { type: "array", items: { type: "string" } }, format: { type: "string", enum: ["text","json","mermaid"], default: "text" } },
-            required: ["from","to"]
-          }
-        }
       ]
     };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name === "search-notes") {
-      let query = request.params.arguments?.libraryName as string;
-      if (!query) {
-        throw new Error("Missing required parameter: libraryName");
-      }
+    if (request.params.name === "search") {
       const args = request.params.arguments || {} as any;
+      const engine = String(args.engine || 'auto');
+      const format = String(args.format || 'text');
       const limit = Number(args.limit) || 20;
-      const mode = (args.mode as any) || 'balanced';
+      const offset = Number(args.offset) || 0;
       const includeLinked = args.includeLinked !== false;
+      let query = String(args.query || '');
+      if (!query) {
+        throw new Error("Missing required parameter: query");
+      }
 
       // Поддержка пресетов: если строка начинается с preset:, заменяем на шаблон
-      if (query.startsWith('preset:')) {
+      if (engine !== 'semantic' && query.startsWith('preset:')) {
         const key = query.slice('preset:'.length);
         const preset = serverInstance!.getQueryPresets()[key];
         if (preset) {
@@ -4007,7 +3767,21 @@ Frontmatter: можно передать объект ключ-значение 
         }
       }
 
-      const results = serverInstance!.searchNotes(query, limit, { mode, includeLinked });
+      let textOut = '';
+      if (engine === 'semantic' || (engine === 'auto' && (serverInstance as any)?.semanticEnabled)) {
+        const filters = args.filters || {};
+        const sem = serverInstance!.semanticQuery({ query, topK: limit, offset, filters });
+        if (format === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(sem, null, 2) }] };
+        }
+        textOut = sem.map((r: any, i: number) => `${i+1}. ${r.title} — ${r.path}  (score: ${r.score.toFixed(3)})\n${r.snippet}`).join('\n\n');
+        return { content: [{ type: 'text', text: (textOut || `❌ No results`) }] };
+      }
+
+      const results = serverInstance!.searchNotes(query, limit, { mode: 'balanced', includeLinked });
+      if (format === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      }
       
       // Форматируем результаты для отображения
       const formattedContent = results.length > 0 ? 
@@ -4053,26 +3827,6 @@ Try:
       };
     }
 
-    if (request.params.name === "find-uncategorized-notes") {
-      const args = request.params.arguments || {} as any;
-      const limit = Number(args.limit) || 20;
-      const items = serverInstance!.findUncategorizedNotes({ limit });
-      const formatted = items.map((i, idx) => `${idx + 1}. ${i.title} — \`${i.path}\` \n   reasons: ${i.reasons.join(', ')}`).join('\n');
-      return {
-        content: [{ type: 'text', text: (items.length ? `🧹 Found ${items.length} uncategorized notes:\n\n${formatted}` : '✅ No uncategorized notes found.') }]
-      };
-    }
-
-    if (request.params.name === "normalize-note-baseline") {
-      const args = request.params.arguments || {} as any;
-      const filePath = String(args.filePath || '');
-      const dryRun = Boolean(args.dryRun);
-      if (!filePath) throw new Error('filePath is required');
-      const res = serverInstance!.normalizeNoteBaseline({ filePath, dryRun });
-      return {
-        content: [{ type: 'text', text: `🧰 Normalized: \`${res.path}\`\nUpdated keys: ${res.updatedKeys.join(', ') || 'none'}\nGuess: ${JSON.stringify(res.guessed, null, 2)}` }]
-      };
-    }
 
     if (request.params.name === "get-note-content") {
       let noteId = request.params.arguments?.context7CompatibleLibraryID as string;
@@ -4203,271 +3957,294 @@ ${content}`
       };
     }
 
-    if (request.params.name === "write-note") {
+    if (request.params.name === "notes") {
       const args = request.params.arguments || {} as any;
-      const filePath = args.filePath as string;
-      const content = args.content as string;
-      const writeMode = (args.writeMode as 'create' | 'overwrite' | 'append') || 'create';
-      const heading = args.heading as (string | undefined);
-      const frontmatter = args.frontmatter as (Record<string, any> | undefined);
-      const ensureMdExtension = (args.ensureMdExtension as boolean) ?? true;
-      const createMissingFolders = (args.createMissingFolders as boolean) ?? true;
+      const op = String(args.operation || 'write');
 
-      if (!filePath || !content) {
-        throw new Error("Missing required parameters: filePath, content");
+      if (op === 'write') {
+        const filePath = String(args.filePath || '');
+        const content = String(args.content || '');
+        if (!filePath || !content) throw new Error('filePath and content are required for operation=write');
+        const res = serverInstance!.writeNote({
+          filePath,
+          content,
+          writeMode: (args.writeMode as 'create'|'overwrite'|'append') || 'create',
+          heading: args.heading,
+          frontmatter: args.frontmatter,
+          ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+          createMissingFolders: (args.createMissingFolders as boolean) ?? true
+        });
+        return { content: [{ type: 'text', text: `✅ Note written: ${res.relativePath} (mode=${args.writeMode||'create'}, bytes=${res.bytesWritten})` }] };
       }
 
-      const result = serverInstance!.writeNote({
-        filePath,
-        content,
-        writeMode,
-        heading,
-        frontmatter,
-        ensureMdExtension,
-        createMissingFolders
-      });
+      if (op === 'append-under') {
+        const filePath = String(args.filePath || '');
+        const heading = String(args.heading || '');
+        const raw = String(args.content || '');
+        if (!filePath || !heading || !raw) throw new Error('filePath, heading and content are required for operation=append-under');
+        const content = `${(args.bullet===true)?'- ':''}${(args.timestamp===true)?(new Date().toISOString()+' '):''}${raw}`;
+        const res = serverInstance!.writeNote({
+          filePath,
+          content,
+          writeMode: 'append',
+          heading,
+          ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+          createMissingFolders: (args.createMissingFolders as boolean) ?? true
+        });
+        return { content: [{ type: 'text', text: `✅ Appended under "${heading}": ${res.relativePath} (bytes=${res.bytesWritten})` }] };
+      }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Note written successfully\n\n- Path: ${result.relativePath}\n- Absolute: ${result.absolutePath}\n- Mode: ${writeMode}\n- Bytes: ${result.bytesWritten}\n- Created: ${result.created}\n- Overwritten: ${result.overwritten}\n- Appended: ${result.appended}`
+      if (op === 'journal') {
+        const content = String(args.content || '');
+        if (!content) throw new Error('content is required for operation=journal');
+        const res = serverInstance!.dailyJournalAppend({
+          content,
+          heading: args.heading || 'Inbox',
+          bullet: (args.bullet as boolean) ?? true,
+          timestamp: (args.timestamp as boolean) ?? true,
+          filePath: args.filePath,
+          date: args.date
+        });
+        return { content: [{ type: 'text', text: `🗒️ Journal appended: ${res.path}` }] };
+      }
+
+      if (op === 'template') {
+        const template = String(args.template || '');
+        if (!template) throw new Error('template is required for operation=template');
+        const r = serverInstance!.applyTemplate({ template, variables: args.variables, filePath: args.filePath, writeMode: args.writeMode, heading: args.heading });
+        const info = r.writtenPath ? `\nWritten to: ${r.writtenPath}` : '';
+        return { content: [{ type: 'text', text: `✅ Template applied${info}\n\n${r.content}` }] };
+      }
+
+      if (op === 'create-node') {
+        const filePath = String(args.filePath || '');
+        if (!filePath) throw new Error('filePath is required for operation=create-node');
+        const res = serverInstance!.createNode({
+          filePath,
+          title: args.title,
+          type: args.type,
+          properties: args.properties,
+          content: args.content,
+          ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+          createMissingFolders: (args.createMissingFolders as boolean) ?? true
+        });
+        return { content: [{ type: 'text', text: `✅ Node created: ${res.relativePath}` }] };
+      }
+
+      // === merged note-ops operations ===
+      if (op === 'capture') {
+        const res = serverInstance!.captureNote({
+          name: String(args.name || ''),
+          content: String(args.content || ''),
+          tags: Array.isArray(args.tags) ? args.tags : undefined,
+          relations: Array.isArray(args.relations) ? args.relations : undefined,
+          folder: args.folder,
+          linkToHub: (args.linkToHub as boolean) ?? true,
+          hubs: Array.isArray(args.hubs) ? args.hubs : undefined,
+        });
+        return { content: [{ type: 'text', text: `✅ Captured: ${res.path}` }] };
+      }
+
+      if (op === 'frontmatter') {
+        const res = serverInstance!.upsertFrontmatter({
+          filePath: String(args.filePath || ''),
+          set: args.set,
+          removeKeys: args.removeKeys,
+          ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+          createMissingFolders: (args.createMissingFolders as boolean) ?? true
+        });
+        return { content: [{ type: 'text', text: `✅ Frontmatter updated: ${res.relativePath}` }] };
+      }
+
+      if (op === 'link' || op === 'unlink') {
+        const params = {
+          fromPath: String(args.fromPath || ''),
+          toPath: String(args.toPath || ''),
+          relation: args.relation || 'related',
+          mode: (args.mode as 'property'|'body'|'both') || 'both',
+          bidirectional: (args.bidirectional as boolean) ?? true,
+          heading: args.heading || 'Relations'
+        };
+        const res = op === 'link' ? serverInstance!.linkNotes(params) : serverInstance!.unlinkNotes(params as any);
+        const verb = op === 'link' ? 'Linked' : 'Unlinked';
+        const arrow = op === 'link' ? '⇄' : '↮';
+        return { content: [{ type: 'text', text: `✅ ${verb}: ${params.fromPath} ${arrow} ${params.toPath} (${params.mode}/${params.relation})` }] };
+      }
+
+      if (op === 'move') {
+        const res = serverInstance!.moveNote({ fromPath: String(args.fromPath||''), toPath: String(args.toPath||''), overwrite: (args.overwrite as boolean) ?? false });
+        return { content: [{ type: 'text', text: `📦 Moved: ${res.from} → ${res.to}` }] };
+      }
+      if (op === 'clone') {
+        const res = serverInstance!.cloneNote({ fromPath: String(args.fromPath||''), toPath: String(args.toPath||''), setTitle: args.setTitle });
+        return { content: [{ type: 'text', text: `📄 Cloned: ${res.from} → ${res.to}` }] };
+      }
+      if (op === 'delete') {
+        const res = serverInstance!.deleteNote({ path: String(args.path||'') });
+        return { content: [{ type: 'text', text: `🗑️ Deleted: ${res.deletedPath}` }] };
+      }
+
+      if (op === 'autolink') {
+        const res = serverInstance!.bulkAutolink({ mappings: args.mappings || [], maxPerFile: args.maxPerFile, limitFiles: args.limitFiles });
+        return { content: [{ type: 'text', text: `🔗 Bulk autolink updated files: ${res.updatedFiles}` }] };
+      }
+
+      if (op === 'find-unlinked-mentions') {
+        const terms: string[] = (args.terms as string[]) || [];
+        const maxPerFile = (args.maxPerFile as number) ?? 3;
+        const limitFiles = (args.limitFiles as number) ?? 30;
+        const patterns = terms.map(t => ({ term: t, re: new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') }));
+        const suggestions: string[] = [];
+        let filesCount = 0;
+        for (const n of serverInstance!.getIndexData()) {
+          if (n.path.startsWith('.obsidian/') || n.path.includes('/node_modules/')) continue;
+          if (filesCount >= limitFiles) break;
+          const text = (n.content || n.content_preview || '');
+          let hits = 0;
+          for (const { term, re } of patterns) {
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(text)) !== null) {
+              const idx = m.index;
+              const before = text.slice(Math.max(0, idx - 2), idx);
+              if (before === '[[') continue;
+              const start = Math.max(0, idx - 40);
+              const end = Math.min(text.length, idx + term.length + 40);
+              const snippet = text.slice(start, end).replace(/\n/g, ' ');
+              suggestions.push(`- ${n.path}: …${snippet}…`);
+              hits++;
+              if (hits >= maxPerFile) break;
+            }
+            if (hits >= maxPerFile) break;
           }
-        ]
-      };
-    }
-
-    if (request.params.name === "append-under-heading") {
-      const args = request.params.arguments || {} as any;
-      const filePath = args.filePath as string;
-      const heading = args.heading as string;
-      const rawContent = args.content as string;
-      const bullet = (args.bullet as boolean) ?? false;
-      const timestamp = (args.timestamp as boolean) ?? false;
-      const ensureMdExtension = (args.ensureMdExtension as boolean) ?? true;
-      const createMissingFolders = (args.createMissingFolders as boolean) ?? true;
-
-      if (!filePath || !heading || !rawContent) {
-        throw new Error("Missing required parameters: filePath, heading, content");
+          if (hits > 0) filesCount++;
+        }
+        const outText = suggestions.length ? suggestions.join('\n') : 'No unlinked mentions found';
+        return { content: [{ type: 'text', text: outText }] };
       }
 
-      const content = `${bullet ? '- ' : ''}${timestamp ? new Date().toISOString() + ' ' : ''}${rawContent}`;
-
-      const result = serverInstance!.writeNote({
-        filePath,
-        content,
-        writeMode: 'append',
-        heading,
-        ensureMdExtension,
-        createMissingFolders
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Appended under heading\n\n- Path: ${result.relativePath}\n- Heading: ${heading}\n- Bytes: ${result.bytesWritten}`
-          }
-        ]
-      };
+      throw new Error(`Unknown operation: ${op}`);
     }
 
-    if (request.params.name === "create-node") {
+
+
+
+
+    if (request.params.name === "index") {
       const args = request.params.arguments || {} as any;
-      const result = serverInstance!.createNode({
-        filePath: args.filePath,
-        title: args.title,
-        type: args.type,
-        properties: args.properties,
-        content: args.content,
-        ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
-        createMissingFolders: (args.createMissingFolders as boolean) ?? true
-      });
-      return {
-        content: [
-          { type: "text", text: `✅ Node created at ${result.relativePath}` }
-        ]
-      };
-    }
-
-    if (request.params.name === "link-notes") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.linkNotes({
-        fromPath: args.fromPath,
-        toPath: args.toPath,
-        relation: args.relation || 'related',
-        mode: (args.mode as 'property' | 'body' | 'both') || 'both',
-        bidirectional: (args.bidirectional as boolean) ?? true,
-        heading: args.heading || 'Relations'
-      });
-      return {
-        content: [
-          { type: "text", text: `✅ Linked: ${res.fromPath} ⇄ ${res.toPath} (${res.mode}/${res.relation})` }
-        ]
-      };
-    }
-
-    if (request.params.name === "upsert-frontmatter") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.upsertFrontmatter({
-        filePath: args.filePath,
-        set: args.set,
-        removeKeys: args.removeKeys,
-        ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
-        createMissingFolders: (args.createMissingFolders as boolean) ?? true
-      });
-      return {
-        content: [
-          { type: "text", text: `✅ Frontmatter updated: ${res.relativePath}` }
-        ]
-      };
-    }
-
-    if (request.params.name === "unlink-notes") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.unlinkNotes({
-        fromPath: args.fromPath,
-        toPath: args.toPath,
-        relation: args.relation || 'related',
-        mode: (args.mode as 'property' | 'body' | 'both') || 'both',
-        bidirectional: (args.bidirectional as boolean) ?? true,
-        heading: args.heading || 'Relations'
-      });
-      return {
-        content: [
-          { type: "text", text: `✅ Unlinked: ${args.fromPath} ↮ ${args.toPath} (${args.mode || 'both'}/${args.relation || 'related'})` }
-        ]
-      };
-    }
-
-    if (request.params.name === "reindex-vault") {
-      const res = await serverInstance!.reindexVault();
-      return {
-        content: [
-          { type: "text", text: `🔄 Reindexed notes: ${res.notes}` }
-        ]
-      };
-    }
-
-    if (request.params.name === "repair-graph") {
-      const res = serverInstance!.repairGraph();
-      return { content: [{ type: 'text', text: `🧹 Graph repaired: ${res.fixed} relations ensured/cleaned` }] };
-    }
-
-    if (request.params.name === "apply-template") {
-      const args = request.params.arguments || {} as any;
-      const rendered = serverInstance!.applyTemplate({
-        template: args.template,
-        variables: args.variables,
-        filePath: args.filePath,
-        writeMode: args.writeMode,
-        heading: args.heading
-      });
-      const pathInfo = rendered.writtenPath ? `\nWritten to: ${rendered.writtenPath}` : '';
-      return { content: [{ type: 'text', text: `✅ Template applied${pathInfo}\n\n${rendered.content}` }] };
-    }
-
-    if (request.params.name === "get-graph-policy") {
-      const p = serverInstance!.getGraphPolicyPublic();
-      return { content: [{ type: 'text', text: JSON.stringify(p, null, 2) }] };
-    }
-
-    if (request.params.name === "reload-graph-policy") {
-      serverInstance!.loadGraphPolicy();
-      return { content: [{ type: 'text', text: `🔁 Graph policy reloaded (mode=${serverInstance!.getGraphPolicyPublic().mode})` }] };
-    }
-
-    if (request.params.name === "validate-graph") {
-      const args = request.params.arguments || {} as any;
-      const prefix = (args.pathPrefix as string) || '';
-      const items = serverInstance!.getIndexData().filter((n: ObsidianNote) => n.path.endsWith('.md') && (!prefix || n.path.startsWith(prefix)));
-      const results = [] as Array<{ path: string; issues: string[] }>;
-      for (const n of items) {
-        const content = n.content || n.content_preview || '';
-        const parsed = serverInstance!.parseFrontmatterPublic(content);
-        const issues = serverInstance!.validateAgainstPolicyPublic(n.path, parsed.frontmatter || {});
-        if (issues.length) results.push({ path: n.path, issues });
+      const action = String(args.action || 'reindex-full');
+      if (action === 'reindex-full') {
+        const res = await serverInstance!.reindexVault();
+        return { content: [{ type: 'text', text: `🔄 Reindexed notes: ${res.notes}` }] };
       }
-      const summary = { total: items.length, invalid: results.length };
-      return { content: [{ type: 'text', text: JSON.stringify({ summary, results }, null, 2) }] };
-    }
-
-    if (request.params.name === "bulk-autolink") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.bulkAutolink({ mappings: args.mappings || [], maxPerFile: args.maxPerFile, limitFiles: args.limitFiles });
-      return { content: [{ type: 'text', text: `🔗 Bulk autolink updated files: ${res.updatedFiles}` }] };
-    }
-
-    if (request.params.name === "note-move") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.moveNote({ fromPath: args.fromPath, toPath: args.toPath, overwrite: args.overwrite });
-      return { content: [{ type: 'text', text: `📦 Moved: ${res.from} → ${res.to}` }] };
-    }
-
-    if (request.params.name === "note-clone") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.cloneNote({ fromPath: args.fromPath, toPath: args.toPath, setTitle: args.setTitle });
-      return { content: [{ type: 'text', text: `📄 Cloned: ${res.from} → ${res.to}` }] };
-    }
-
-    if (request.params.name === "note-delete") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.deleteNote({ path: args.path });
-      return { content: [{ type: 'text', text: `🗑️ Deleted: ${res.deletedPath}` }] };
-    }
-
-    if (request.params.name === "get-graph-summary") {
-      const args = request.params.arguments || {} as any;
-      const noteId = args.noteId as string;
-      const depth = Math.max(1, Math.min(3, (args.depth as number) || 1));
-      const direction = (args.direction as 'in'|'out'|'both') || 'both';
-      const relation = args.relation as (string|undefined);
-
-      const startPath = serverInstance!.getNotePathFromId(noteId);
-      if (!startPath) throw new Error(`Note not found: ${noteId}`);
-
-      const visited = new Set<string>();
-      const layers: string[][] = [];
-      let current = [startPath];
-      visited.add(startPath);
-
-      for (let d = 0; d < depth; d++) {
-        const next: string[] = [];
-        const layer: string[] = [];
-        for (const p of current) {
-          let outs: string[] = [];
-          let ins: string[] = [];
-          if (direction === 'out' || direction === 'both') outs = serverInstance!.getOutgoingPathsPub(p);
-          if (direction === 'in' || direction === 'both') ins = serverInstance!.getBacklinkPathsPub(p);
-          const all = [...outs, ...ins];
-          for (const q of all) {
-            if (!visited.has(q)) {
-              visited.add(q);
-              layer.push(q);
-              next.push(q);
+      if (action === 'reindex-since') {
+        const sinceIso = String(args.since || '');
+        const since = new Date(sinceIso).getTime();
+        if (Number.isNaN(since)) throw new Error('Invalid ISO date');
+        const vaultRoot = path.resolve(serverInstance!.getVaultRoot());
+        let changed = 0;
+        const walk = (dir: string) => {
+          const entries = readdirSync(dir);
+          for (const entry of entries) {
+            const full = path.join(dir, entry);
+            const st = statSync(full);
+            if (st.isDirectory()) walk(full);
+            else if (st.isFile() && entry.toLowerCase().endsWith('.md')) {
+              if (st.mtimeMs >= since) {
+                const rel = path.relative(vaultRoot, full).replace(/\\/g, '/');
+                serverInstance!.reindexFileIncremental(rel);
+                changed++;
+              }
             }
           }
-        }
-        if (layer.length > 0) layers.push(layer);
-        current = next;
+        };
+        walk(vaultRoot);
+        return { content: [{ type: 'text', text: `Delta reindexed: ${changed}` }] };
       }
-
-      const lines: string[] = [];
-      lines.push(`Root: ${startPath}`);
-      layers.forEach((layer, i) => {
-        lines.push(`Depth ${i+1}:`);
-        for (const p of layer) {
-          const n = serverInstance!.getIndexData().find(x => x.path === p);
-          const degOut = serverInstance!.getOutgoingPathsPub(p).length;
-          const degIn = serverInstance!.getBacklinkPathsPub(p).length;
-          lines.push(`- ${p} (${(n?.title)||''}) out:${degOut} in:${degIn}`);
-        }
-      });
-
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
+      if (action === 'embed-one') {
+        const noteId = String(args.noteId || '');
+        if (!noteId) throw new Error('noteId is required for embed-one');
+        const res = serverInstance!.embedAndUpsert({ noteId, mode: args.mode });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+      if (action === 'embed-build') {
+        const res = serverInstance!.semanticBuildIndex({ limit: args.limit });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
+      throw new Error(`Unknown index action: ${action}`);
     }
 
-    if (request.params.name === "find-unlinked-mentions") {
+    if (false && request.params.name === "note-ops") {
+      const args = request.params.arguments || {} as any;
+      const op = String(args.operation || 'capture');
+
+      if (op === 'capture') {
+        const res = serverInstance!.captureNote({
+          name: String(args.name || ''),
+          content: String(args.content || ''),
+          tags: Array.isArray(args.tags) ? args.tags : undefined,
+          relations: Array.isArray(args.relations) ? args.relations : undefined,
+          folder: args.folder,
+          linkToHub: (args.linkToHub as boolean) ?? true,
+          hubs: Array.isArray(args.hubs) ? args.hubs : undefined,
+        });
+        return { content: [{ type: 'text', text: `✅ Captured: ${res.path}` }] };
+      }
+
+      if (op === 'frontmatter') {
+        const res = serverInstance!.upsertFrontmatter({
+          filePath: String(args.filePath || ''),
+          set: args.set,
+          removeKeys: args.removeKeys,
+          ensureMdExtension: (args.ensureMdExtension as boolean) ?? true,
+          createMissingFolders: (args.createMissingFolders as boolean) ?? true
+        });
+        return { content: [{ type: 'text', text: `✅ Frontmatter updated: ${res.relativePath}` }] };
+      }
+
+      if (op === 'link' || op === 'unlink') {
+        const params = {
+          fromPath: String(args.fromPath || ''),
+          toPath: String(args.toPath || ''),
+          relation: args.relation || 'related',
+          mode: (args.mode as 'property'|'body'|'both') || 'both',
+          bidirectional: (args.bidirectional as boolean) ?? true,
+          heading: args.heading || 'Relations'
+        };
+        const res = op === 'link' ? serverInstance!.linkNotes(params) : serverInstance!.unlinkNotes(params as any);
+        const verb = op === 'link' ? 'Linked' : 'Unlinked';
+        const arrow = op === 'link' ? '⇄' : '↮';
+        return { content: [{ type: 'text', text: `✅ ${verb}: ${params.fromPath} ${arrow} ${params.toPath} (${params.mode}/${params.relation})` }] };
+      }
+
+      if (op === 'move') {
+        const res = serverInstance!.moveNote({ fromPath: String(args.fromPath||''), toPath: String(args.toPath||''), overwrite: (args.overwrite as boolean) ?? false });
+        return { content: [{ type: 'text', text: `📦 Moved: ${res.from} → ${res.to}` }] };
+      }
+      if (op === 'clone') {
+        const res = serverInstance!.cloneNote({ fromPath: String(args.fromPath||''), toPath: String(args.toPath||''), setTitle: args.setTitle });
+        return { content: [{ type: 'text', text: `📄 Cloned: ${res.from} → ${res.to}` }] };
+      }
+      if (op === 'delete') {
+        const res = serverInstance!.deleteNote({ path: String(args.path||'') });
+        return { content: [{ type: 'text', text: `🗑️ Deleted: ${res.deletedPath}` }] };
+      }
+
+      if (op === 'autolink') {
+        const res = serverInstance!.bulkAutolink({ mappings: args.mappings || [], maxPerFile: args.maxPerFile, limitFiles: args.limitFiles });
+        return { content: [{ type: 'text', text: `🔗 Bulk autolink updated files: ${res.updatedFiles}` }] };
+      }
+
+      throw new Error(`Unknown note-ops operation: ${op}`);
+    }
+
+
+
+
+
+
+
+
+    if (false && request.params.name === "find-unlinked-mentions") {
       const args = request.params.arguments || {} as any;
       const terms: string[] = (args.terms as string[]) || [];
       const maxPerFile = (args.maxPerFile as number) ?? 3;
@@ -4483,9 +4260,8 @@ ${content}`
         const text = (n.content || n.content_preview || '');
         let hits = 0;
         for (const { term, re } of patterns) {
-          let m: RegExpExecArray | null;
-          while ((m = re.exec(text)) !== null) {
-            const idx = m.index;
+          for (const mm of text.matchAll(re)) {
+            const idx = mm.index ?? 0;
             const before = text.slice(Math.max(0, idx - 2), idx);
             if (before === '[[') continue; // уже линк
             const start = Math.max(0, idx - 40);
@@ -4504,78 +4280,176 @@ ${content}`
       return { content: [{ type: 'text', text: outText }] };
     }
 
-    if (request.params.name === "capture-note") {
+
+
+
+    if (request.params.name === "graph") {
       const args = request.params.arguments || {} as any;
-      const res = serverInstance!.captureNote({
-        name: String(args.name || ''),
-        content: String(args.content || ''),
-        tags: Array.isArray(args.tags) ? args.tags : undefined,
-        relations: Array.isArray(args.relations) ? args.relations : undefined,
-        folder: args.folder,
-        linkToHub: (args.linkToHub as boolean) ?? true
-      });
-      return { content: [{ type: 'text', text: `✅ Captured: ${res.path}` }] };
+      const action = String(args.action || 'validate');
+
+      if (action === 'repair') {
+        const res = serverInstance!.repairGraph();
+        return { content: [{ type: 'text', text: `🧹 Graph repaired: ${res.fixed} relations ensured/cleaned` }] };
+      }
+
+      if (action === 'purge-subtree') {
+        const pathPrefix = String(args.pathPrefix || args.prefix || '');
+        const dryRun = (args.dryRun as boolean) ?? false;
+        const deleteNonMd = (args.deleteNonMd as boolean) ?? false;
+        if (!pathPrefix) throw new Error('pathPrefix is required for purge-subtree');
+        const res = serverInstance!.purgeSubtree({ pathPrefix, dryRun, deleteNonMd });
+        const summary = dryRun
+          ? `🔎 Dry run: would remove ${res.listedFiles?.length || 0} files and ${res.listedDirs?.length || 0} dirs under ${pathPrefix}`
+          : `🧹 Purged ${res.removedFiles} files and ${res.removedDirs} directories under ${pathPrefix}`;
+        return { content: [{ type: 'text', text: summary }] };
+      }
+
+      if (action === 'reload-policy') {
+        serverInstance!.loadGraphPolicy();
+        const p = serverInstance!.getGraphPolicyPublic();
+        return { content: [{ type: 'text', text: `🔁 Graph policy reloaded (mode=${p.mode})` }] };
+      }
+
+      if (action === 'validate') {
+        const prefix = (args.pathPrefix as string) || '';
+        const items = serverInstance!.getIndexData().filter((n: ObsidianNote) => n.path.endsWith('.md') && (!prefix || n.path.startsWith(prefix)));
+        const results = [] as Array<{ path: string; issues: string[] }>;
+        for (const n of items) {
+          const content = n.content || n.content_preview || '';
+          const parsed = serverInstance!.parseFrontmatterPublic(content);
+          const issues = serverInstance!.validateAgainstPolicyPublic(n.path, parsed.frontmatter || {});
+          if (issues.length) results.push({ path: n.path, issues });
+        }
+        const summary = { total: items.length, invalid: results.length };
+        return { content: [{ type: 'text', text: JSON.stringify({ summary, results }, null, 2) }] };
+      }
+
+      if (action === 'normalize-baseline') {
+        const filePath = String(args.filePath || '');
+        const dryRun = (args.dryRun as boolean) ?? false;
+        const forceParent = (args.forceParent as boolean) ?? false;
+        if (!filePath) throw new Error('filePath is required for normalize-baseline');
+        const res = serverInstance!.normalizeNoteBaseline({ filePath, dryRun, forceParent });
+        return { content: [{ type: 'text', text: `🧰 Normalized: \`${res.path}\`\nUpdated keys: ${res.updatedKeys.join(', ') || 'none'}\nGuess: ${JSON.stringify(res.guessed, null, 2)}` }] };
+      }
+
+      if (action === 'find-uncategorized') {
+        const limit = Number(args.limit) || 20;
+        const items = serverInstance!.findUncategorizedNotes({ limit });
+        const formatted = items.map((i, idx) => `${idx + 1}. ${i.title} — \`${i.path}\` \n   reasons: ${i.reasons.join(', ')}`).join('\n');
+        return { content: [{ type: 'text', text: (items.length ? `🧹 Found ${items.length} uncategorized notes:\n\n${formatted}` : '✅ No uncategorized notes found.') }] };
+      }
+
+      throw new Error(`Unknown graph-maintenance action: ${action}`);
     }
 
-    if (request.params.name === "daily-journal-append") {
+    if (false && request.params.name === "graph-query") {
       const args = request.params.arguments || {} as any;
-      const res = serverInstance!.dailyJournalAppend({
-        content: String(args.content || ''),
-        heading: args.heading,
-        bullet: (args.bullet as boolean) ?? true,
-        timestamp: (args.timestamp as boolean) ?? true,
-        filePath: args.filePath,
-        date: args.date
-      });
-      return { content: [{ type: 'text', text: `🗒️ Appended to daily: ${res.path}` }] };
-    }
+      const view = String(args.view || 'summary');
 
-    if (request.params.name === "embed-and-upsert") {
-      const args = request.params.arguments || {} as any;
-      const noteId = String(args.noteId || '');
-      if (!noteId) throw new Error('noteId is required');
-      const res = serverInstance!.embedAndUpsert({ noteId, mode: args.mode });
-      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
-    }
+      if (view === 'policy') {
+        const p = serverInstance!.getGraphPolicyPublic();
+        return { content: [{ type: 'text', text: JSON.stringify(p, null, 2) }] };
+      }
 
-    if (request.params.name === "semantic-build-index") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.semanticBuildIndex({ limit: args.limit });
-      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
-    }
+      if (view === 'relations') {
+        const noteId = String(args.noteId || '');
+        if (!noteId) throw new Error('noteId is required for view=relations');
+        const res = serverInstance!.getRelationsOfNote({ noteId, include: args.include });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      }
 
-    if (request.params.name === "semantic-query") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.semanticQuery({ query: String(args.query||''), topK: args.topK, offset: args.offset, filters: args.filters });
-      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
-    }
+      if (view === 'neighborhood') {
+        const noteId = String(args.noteId || '');
+        if (!noteId) throw new Error('noteId is required for view=neighborhood');
+        const res = serverInstance!.getNoteNeighborhood({
+          noteId,
+          depth: args.depth,
+          fanoutLimit: args.fanoutLimit,
+          direction: args.direction,
+          format: args.format || 'json'
+        });
+        const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+        return { content: [{ type: 'text', text }] };
+      }
 
-    if (request.params.name === "reindex-changed-since") {
-      const args = request.params.arguments || {} as any;
-      const sinceIso = args.since as string;
-      const since = new Date(sinceIso).getTime();
-      if (Number.isNaN(since)) throw new Error('Invalid ISO date');
+      if (view === 'path') {
+        const from = String(args.from || '');
+        const to = String(args.to || '');
+        if (!from || !to) throw new Error('from and to are required for view=path');
+        const res = serverInstance!.findPathBetween({ from, to, direction: args.direction, maxDepth: args.maxDepth, allowedRelations: args.allowedRelations, format: args.format });
+        const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+        return { content: [{ type: 'text', text }] };
+      }
 
-      const vaultRoot = path.resolve(serverInstance!.getVaultRoot());
-      let changed = 0;
-      const walk = (dir: string) => {
-        const entries = readdirSync(dir);
-        for (const entry of entries) {
-          const full = path.join(dir, entry);
-          const st = statSync(full);
-          if (st.isDirectory()) walk(full);
-          else if (st.isFile() && entry.toLowerCase().endsWith('.md')) {
-            if (st.mtimeMs >= since) {
-              const rel = path.relative(vaultRoot, full).replace(/\\/g, '/');
-              serverInstance!.reindexFileIncremental(rel);
-              changed++;
+      if (view === 'snapshot') {
+        const res = serverInstance!.getGraphSnapshot({
+          scope: args.scope,
+          depth: args.depth,
+          direction: args.direction,
+          include: args.include,
+          maxNodes: args.maxNodes,
+          maxEdges: args.maxEdges,
+          annotate: args.annotate,
+          format: args.format,
+          allowedRelations: args.allowedRelations,
+          nodeFilter: args.nodeFilter
+        });
+        const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+        return { content: [{ type: 'text', text }] };
+      }
+
+      // summary (человекочитаемый обзор). Реализация аналогична прежнему get-graph-summary.
+      {
+        const noteId = String(args.noteId || '');
+        if (!noteId) throw new Error('noteId is required for view=summary');
+        const depth = Math.max(1, Math.min(3, (args.depth as number) || 1));
+        const direction = (args.direction as 'in'|'out'|'both') || 'both';
+        const startPath = serverInstance!.getNotePathFromId(noteId);
+        if (!startPath) throw new Error(`Note not found: ${noteId}`);
+        const startPathStr: string = String(startPath);
+
+        const visited = new Set<string>();
+        const layers: string[][] = [];
+        let current: string[] = [startPathStr];
+        visited.add(startPathStr);
+        for (let d = 0; d < depth; d++) {
+          const next: string[] = [];
+          const layer: string[] = [];
+          for (const p of current) {
+            let outs: string[] = [];
+            let ins: string[] = [];
+            if (direction === 'out' || direction === 'both') outs = serverInstance!.getOutgoingPathsPub(p);
+            if (direction === 'in' || direction === 'both') ins = serverInstance!.getBacklinkPathsPub(p);
+            for (const q of [...outs, ...ins]) {
+              if (!visited.has(q)) { visited.add(q); layer.push(q); next.push(q); }
             }
           }
+          if (layer.length > 0) layers.push(layer);
+          current = next;
         }
-      };
-      walk(vaultRoot);
 
-      return { content: [{ type: 'text', text: `Delta reindexed: ${changed}` }] };
+        if ((args.format || 'text') === 'json') {
+          const nodes = layers.flat().map(p => {
+            const n = serverInstance!.getIndexData().find(x => x.path === p);
+            return { path: p, title: n?.title || '', degIn: serverInstance!.getBacklinkPathsPub(p).length, degOut: serverInstance!.getOutgoingPathsPub(p).length };
+          });
+          return { content: [{ type: 'text', text: JSON.stringify({ root: startPathStr, depth, direction, nodesByLayer: layers, nodes }, null, 2) }] };
+        }
+
+        const lines: string[] = [];
+        lines.push(`Root: ${startPath}`);
+        layers.forEach((layer, i) => {
+          lines.push(`Depth ${i+1}:`);
+          for (const p of layer) {
+            const n = serverInstance!.getIndexData().find(x => x.path === p);
+            const degOut = serverInstance!.getOutgoingPathsPub(p).length;
+            const degIn = serverInstance!.getBacklinkPathsPub(p).length;
+            lines.push(`- ${p} (${(n?.title)||''}) out:${degOut} in:${degIn}`);
+          }
+        });
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
     }
 
     if (request.params.name === "resolve-note") {
@@ -4585,97 +4459,56 @@ ${content}`
       return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
     }
 
-    if (request.params.name === "get-relations-of-note") {
-      const args = request.params.arguments || {} as any;
-      const noteId = String(args.noteId || '');
-      if (!noteId) throw new Error('noteId is required');
-      const res = serverInstance!.getRelationsOfNote({ noteId, include: args.include });
-      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
-    }
 
-    if (request.params.name === "get-note-neighborhood") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.getNoteNeighborhood({
-        noteId: String(args.noteId || ''),
-        depth: args.depth,
-        fanoutLimit: args.fanoutLimit,
-        direction: args.direction,
-        format: args.format
-      });
-      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
-      return { content: [{ type: 'text', text }] };
-    }
 
-    if (request.params.name === "get-graph-snapshot") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.getGraphSnapshot({
-        scope: args.scope,
-        depth: args.depth,
-        direction: args.direction,
-        include: args.include,
-        maxNodes: args.maxNodes,
-        maxEdges: args.maxEdges,
-        annotate: args.annotate,
-        format: args.format,
-        allowedRelations: args.allowedRelations
-      });
-      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
-      return { content: [{ type: 'text', text }] };
-    }
 
-    if (request.params.name === "get-vault-tree") {
+    if (request.params.name === "vault-browse") {
       const args = request.params.arguments || {} as any;
-      const tree = serverInstance!.buildVaultTree({ root: args.root, maxDepth: args.maxDepth, includeFiles: args.includeFiles, includeCounts: args.includeCounts, sort: args.sort, limitPerDir: args.limitPerDir });
-      if ((args.format || 'text') === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(tree, null, 2) }] };
-      }
-      // text renderer
-      const lines: string[] = [];
-      const walk = (node: any, depth: number) => {
-        const indent = '  '.repeat(depth);
-        if (node.type === 'directory') {
-          const info = node.counts ? ` (md: ${node.counts.md_files || 0}${node.mtimeLatest ? `, latest: ${node.mtimeLatest.slice(0,10)}`:''})` : '';
-          lines.push(`${indent}${node.path || node.name}${info}`);
-          for (const c of node.children || []) walk(c, depth + 1);
-        } else {
-          lines.push(`${indent}- ${node.name}${node.mtime ? ` (${node.mtime})`:''}`);
+      const mode = String(args.mode || 'tree');
+      if (mode === 'tree') {
+        const tree = serverInstance!.buildVaultTree({ root: args.root, maxDepth: args.maxDepth, includeFiles: args.includeFiles, includeCounts: args.includeCounts, sort: args.sort, limitPerDir: args.limitPerDir });
+        if ((args.format || 'text') === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(tree, null, 2) }] };
         }
-      };
-      walk(tree, 0);
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
-    }
-
-    if (request.params.name === "get-folder-contents") {
-      const args = request.params.arguments || {} as any;
-      const rows = serverInstance!.buildFolderContents({ folderPath: String(args.folderPath || ''), recursive: args.recursive, sortBy: args.sortBy, limit: args.limit, filter: args.filter });
-    if ((args.format || 'text') === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
-      }
-      if ((args.format || 'text') === 'table') {
-        const header: string[] = ['Title','Path','mtime','in','out'];
-        const widths: number[] = [
-          Math.max(header[0].length, ...rows.map(r=> (r.title||'').length)),
-          Math.max(header[1].length, ...rows.map(r=> (r.path||'').length)),
-          Math.max(header[2].length, ...rows.map(r=> (r.mtime||'').length)),
-          Math.max(header[3].length, ...rows.map(r=> String(r.degreeIn).length)),
-          Math.max(header[4].length, ...rows.map(r=> String(r.degreeOut).length))
-        ];
-        const pad = (s: string, w: number): string => (s + ' '.repeat(Math.max(0, w - s.length)));
-        const line = (cols: Array<string|number>): string => cols.map((c, i)=> pad(String(c), widths[i])).join('  ');
-        const lines: string[] = [line(header), line(widths.map(w=>'-'.repeat(w)))];
-        for (const r of rows) lines.push(line([r.title, r.path, r.mtime||'', r.degreeIn, r.degreeOut]));
+        const lines: string[] = [];
+        const walk = (node: any, depth: number) => {
+          const indent = '  '.repeat(depth);
+          if (node.type === 'directory') {
+            const info = node.counts ? ` (md: ${node.counts.md_files || 0}${node.mtimeLatest ? `, latest: ${node.mtimeLatest.slice(0,10)}`:''})` : '';
+            lines.push(`${indent}${node.path || node.name}${info}`);
+            for (const c of node.children || []) walk(c, depth + 1);
+          } else {
+            lines.push(`${indent}- ${node.name}${node.mtime ? ` (${node.mtime})`:''}`);
+          }
+        };
+        walk(tree, 0);
         return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } else {
+        const rows = serverInstance!.buildFolderContents({ folderPath: String(args.folderPath || ''), recursive: args.recursive, sortBy: args.sortBy, limit: args.limit, filter: args.filter });
+        if ((args.format || 'text') === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+        }
+        if ((args.format || 'text') === 'table') {
+          const header: string[] = ['Title','Path','mtime','in','out'];
+          const widths: number[] = [
+            Math.max(header[0].length, ...rows.map(r=> (r.title||'').length)),
+            Math.max(header[1].length, ...rows.map(r=> (r.path||'').length)),
+            Math.max(header[2].length, ...rows.map(r=> (r.mtime||'').length)),
+            Math.max(header[3].length, ...rows.map(r=> String(r.degreeIn).length)),
+            Math.max(header[4].length, ...rows.map(r=> String(r.degreeOut).length))
+          ];
+          const pad = (s: string, w: number): string => (s + ' '.repeat(Math.max(0, w - s.length)));
+          const line = (cols: Array<string|number>): string => cols.map((c, i)=> pad(String(c), widths[i])).join('  ');
+          const lines: string[] = [line(header), line(widths.map(w=>'-'.repeat(w)))];
+          for (const r of rows) lines.push(line([r.title, r.path, r.mtime||'', r.degreeIn, r.degreeOut]));
+          return { content: [{ type: 'text', text: lines.join('\n') }] };
+        }
+        const text = rows.map(r => `- ${r.title} — ${r.path}  (mtime: ${r.mtime}, in:${r.degreeIn} out:${r.degreeOut})`).join('\n');
+        return { content: [{ type: 'text', text }] };
       }
-      const text = rows.map(r => `- ${r.title} — ${r.path}  (mtime: ${r.mtime}, in:${r.degreeIn} out:${r.degreeOut})`).join('\n');
-      return { content: [{ type: 'text', text }] };
     }
 
-    if (request.params.name === "find-path-between") {
-      const args = request.params.arguments || {} as any;
-      const res = serverInstance!.findPathBetween({ from: String(args.from || ''), to: String(args.to || ''), direction: args.direction, maxDepth: args.maxDepth, allowedRelations: args.allowedRelations, format: args.format });
-      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
-      return { content: [{ type: 'text', text }] };
-    }
+
 
     throw new Error(`Unknown tool: ${request.params.name}`);
   });

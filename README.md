@@ -58,34 +58,127 @@ Then enable the plugin in Obsidian. Ensure Node is on PATH (for the server proce
   - `npm run start:mcp-http` — experimental HTTP mode
   - `npm run bench` — run benchmarks (set `MCP_BENCH_ENFORCE=true` to enforce thresholds)
 
-## MCP server tools (selection)
+### Quick examples (MCP JSON args)
 
-- Search/content: `search-notes`, `get-note-content`
-- Graph/notes: `create-node`, `write-note`, `append-under-heading`, `upsert-frontmatter`,
-  `link-notes`, `unlink-notes`, `note-move`, `note-clone`, `note-delete`
-- Index/maintenance: `reindex-vault`, `reindex-changed-since`, `normalize-note-baseline`,
-  `find-uncategorized-notes`, `get-graph-summary`, `repair-graph`
+- notes — Write note:
+```json
+{"operation":"write","filePath":"docs/new-note","content":"Hello","writeMode":"create","frontmatter":{"title":"New","type":"note"}}
+```
+- notes — Append under heading with bullet+timestamp:
+```json
+{"operation":"append-under","filePath":"docs/new-note","heading":"Updates","content":"Refined","bullet":true,"timestamp":true}
+```
+- notes — Journal entry for a day:
+```json
+{"operation":"journal","content":"Daily log","date":"2025-09-09","heading":"Inbox","bullet":true,"timestamp":true}
+```
+- notes — Apply template and write:
+```json
+{"operation":"template","template":"## {{title}} at {{datetime}}","variables":{"title":"Meeting"},"filePath":"notes/meeting","writeMode":"create"}
+```
+- notes — Create node:
+```json
+{"operation":"create-node","filePath":"graph/Index/Test Hub","title":"Test Hub","type":"index","properties":{"owner":"you"},"content":"# Test Hub\nThis is an index hub."}
+```
+- notes — Capture quick note:
+```json
+{"operation":"capture","name":"Idea","content":"Thought...","folder":"inbox","tags":["idea"],"relations":["Knowledge Hub"]}
+```
+- notes — Frontmatter upsert:
+```json
+{"operation":"frontmatter","filePath":"docs/new-note","set":{"status":"draft"}}
+```
+- notes — Link notes (bidirectional, body+property):
+```json
+{"operation":"link","fromPath":"docs/new-note","toPath":"graph/Index/Test Hub","mode":"both","relation":"related"}
+```
+- notes — Move/Clone/Delete:
+```json
+{"operation":"move","fromPath":"docs/new-note","toPath":"archive/new-note"}
+{"operation":"clone","fromPath":"docs/new-note","toPath":"docs/new-note-copy","setTitle":"New Note Copy"}
+{"operation":"delete","path":"docs/new-note-copy"}
+```
+- notes — Bulk autolink:
+```json
+{"operation":"autolink","mappings":[{"term":"FAQ","toPath":"docs/FAQ"}],"maxPerFile":2,"limitFiles":50}
+```
+
+- graph — Validate policy on subtree:
+```json
+{"action":"validate","pathPrefix":"graph/Index/"}
+```
+- graph — Repair tree:
+```json
+{"action":"repair"}
+```
+- graph — Reload policy:
+```json
+{"action":"reload-policy"}
+```
+- graph — Normalize a single note baseline (dry run):
+```json
+{"action":"normalize-baseline","filePath":"docs/new-note","dryRun":true}
+```
+- graph — Find uncategorized notes (limit 10):
+```json
+{"action":"find-uncategorized","limit":10}
+```
+
+- index — Reindex all:
+```json
+{"action":"reindex-full"}
+```
+- index — Reindex since ISO timestamp:
+```json
+{"action":"reindex-since","since":"2025-09-01T00:00:00Z"}
+```
+
+- vault — Resolve/browse/content:
+```json
+{"operation":"resolve","input":"Test Hub"}
+{"operation":"browse","mode":"tree","root":"graph/Index","maxDepth":2,"includeFiles":false}
+{"operation":"content","context7CompatibleLibraryID":"graph/Index/Test Hub.md","tokens":1200}
+```
+
+## Unified MCP tools
+
+- search — поиск по заметкам Obsidian
+  - engine: `fuse|semantic|auto`, поддержка фильтров и форматов (`text|json`)
+- notes — все операции с заметками и нодами (единый инструмент)
+  - operations: `write | append-under | journal | template | create-node | capture | frontmatter | link | unlink | move | clone | delete | autolink | find-unlinked-mentions`
+- graph — запросы и обслуживание графа/политики (единый инструмент)
+  - query mode: `view: relations|summary|neighborhood|snapshot|policy|path`
+  - maintenance mode: `action: repair|validate|reload-policy|normalize-baseline|find-uncategorized`
+- index — индексация и семантика
+  - actions: `reindex-full | reindex-since | embed-one | embed-build`
+- vault — утилиты хранилища
+  - operations: `resolve | browse | content`
 
 Notes:
 - RU/EN normalization is lightweight; synonyms can be extended from your vault.
 - Semantic mode can be enabled gradually; text search remains primary.
 
-## Strict tree policy (details)
+## Graph policy (details)
 
 - File: `graph/.graph-policy.yml`
-- Mode: `block` — invalid writes are rejected
-- Rules:
-  - Disallow frontmatter keys: `related`, `depends_on`, `blocks`
-  - Require `part_of` with exactly one parent (feature → “Фичи”, solution → “Решения”)
-  - Body wikilinks: `max_total: 1`, `only_to_parent: true`
-  - Banned headings: `Связи`, `Relations`, `Связанное`, `Related`
-- Validated tools: `write-note`, `append-under-heading`, `upsert-frontmatter`, `link-notes`, `unlink-notes`, `note-move`, `note-clone`
+- Mode: `warn|block` — при `block` нарушения политики вызывают ошибки в мутирующих инструментах
+- Defaults (server):
+  - `links.parentKey: "part_of"`, `links.relationsHeading: "Relations"`
+  - Типы по умолчанию требуют базовые поля (например, `feature|solution|project|index` → `title,type,part_of`), некоторые типы помечены `mustHaveParent: true`
+- Validated operations (policy enforcement):
+  - Единый инструмент `notes` маппится на операции: `write-note`, `append-under-heading`, `upsert-frontmatter`, `link-notes`, `unlink-notes`, `note-move`, `note-clone` (эти идентификаторы используются в policy)
 
 Reindex after bulk edits:
 
 ```bash
+# via MCP unified tool:
+# reindex all
+index {"action":"reindex-full"}
+
+# reindex since ISO timestamp
+index {"action":"reindex-since","since":"2025-09-01T00:00:00Z"}
+
 npm run bench   # optional quality check
-# or via MCP: reindex-vault
 ```
 
 ### Create the policy file
